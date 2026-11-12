@@ -228,3 +228,55 @@ input.missing { background: var(--warn-bg); border-color: var(--warn-border); }
 .report table.form.sign td { border: 1px solid #000; padding: 10px; font-size: 11px; vertical-align: middle; }
 .report table.form.sign td.lbl { font-weight: 400; background: none; width: 190px; }
 .report table.form.sign td.data-lbl { width: 50px; }
+
+/* =========================================================================
+ * Melhorias: confiança, validações, exames de imagem, exportação, sessão
+ * ========================================================================= */
+
+/* Variantes de botão */
+.btn-danger { background: #fbe9e7; color: #b23c17; }
+.btn-danger:hover { background: #f6d5cd; }
+
+/* Legenda extra */
+.tag-err { background: #ffe6d6; border: 1px solid #f0a675; }
+
+/* Banner de confiança */
+.conf-banner { margin: 0 0 14px; display: flex; flex-direction: column; gap: 6px; }
+.conf-banner:empty { display: none; }
+.conf { padding: 8px 12px; border-radius: 8px; font-size: .86rem; border: 1px solid; }
+.conf.ok { background: #e8f5e9; border-color: #b6ddba; color: #22592a; }
+.conf.low { background: #fff3e0; border-color: #ffcc80; color: #8a4b00; }
+.conf.info { background: #e3f0ff; border-color: #b6d4f5; color: #1f4e79; }
+
+/* Campos com atenção / baixa confiança */
+input.warn, textarea.warn { background: #ffe9d6; border-color: #f0a675; }
+input.lowconf, textarea.lowconf { background: #fffaf0; border-color: #ead9a0; }
+.field-msg { display: block; margin-top: 4px; font-size: .76rem; font-weight: 600; }
+.field-warn { color: #b23c17; }
+.field-notice { color: #1f4e79; }
+
+/* Lista de exames de imagem detectados */
+.imaging-list { margin: 0 0 16px; }
+.imaging-list:empty { display: none; }
+.imaging-list h4 { margin: 0 0 8px; color: var(--blue); font-size: .95rem; }
+.img-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: #fafbfc; }
+.img-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: .9rem; }
+.img-head .tag { background: #e3f0ff; color: var(--blue); }
+.img-head .img-date { color: var(--muted); font-size: .82rem; margin-left: auto; }
+.img-impr { margin: 6px 0 2px; font-size: .84rem; }
+.img-ach { margin: 4px 0 0; padding-left: 20px; font-size: .84rem; }
+.img-ach li { margin-bottom: 2px; }
+
+/* Badge de sessão salva */
+.session-badge { color: #2e7d32; font-size: 1.2rem; line-height: 0; }
+
+/* Rodapé de auditoria no relatório */
+.report .audit-footer {
+  max-width: 760px; margin: 24px auto 0; padding: 10px 12px;
+  border-top: 1px solid #bbb; font-size: 10px; color: #444; line-height: 1.4;
+}
+
+@media print {
+  .conf-banner, .imaging-list, .btn-danger, .session-badge { display: none !important; }
+  .report .audit-footer { color: #000; }
+}
