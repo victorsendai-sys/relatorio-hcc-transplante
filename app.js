@@ -88,48 +88,76 @@ async function runAnalysis() {
   clearBtn.disabled = true;
   progress.classList.remove("hidden");
 
-  const worker = await Tesseract.createWorker("por", 1, {
-    logger: (m) => {
-      if (m.status === "recognizing text") {
-        setProgress(m.progress, `Reconhecendo texto… ${Math.round(m.progress * 100)}%`);
-      }
-    },
-  });
+  let worker = null; // criado sob demanda apenas se alguma página precisar de OCR
 
   try {
-    for (let fi = 0; fi < state.files.length; fi++) {
+    const totalFiles = state.files.length;
+    for (let fi = 0; fi < totalFiles; fi++) {
       const entry = state.files[fi];
-      setProgress(0, `Lendo "${entry.name}" (${fi + 1}/${state.files.length})…`);
-
-      const images = await pdfToImages(entry.file, (p) =>
-        setProgress(p * 0.3, `Convertendo páginas de "${entry.name}"…`)
-      );
+      const base = fi / totalFiles;
+      setProgress(base, `Lendo "${entry.name}" (${fi + 1}/${totalFiles})…`);
 
       entry.pages = [];
-      for (let p = 0; p < images.length; p++) {
-        setProgress(0, `OCR "${entry.name}" — página ${p + 1}/${images.length}…`);
-        // Tenta extrair texto digital primeiro; se vazio, usa OCR da imagem.
-        const { data } = await worker.recognize(images[p]);
-        entry.pages.push(data.text || "");
+      entry.pageMeta = []; // { source: "digital"|"ocr", confidence }
+      entry.minConfidence = 100;
+      entry.usedOcr = false;
+
+      const pdf = await pdfjsLib.getDocument({ data: await entry.file.arrayBuffer() }).promise;
+
+      for (let p = 1; p <= pdf.numPages; p++) {
+        const page = await pdf.getPage(p);
+
+        // (#9) Primeiro tenta a camada de texto digital — rápido e sem erros de OCR.
+        const digital = await extractDigitalText(page);
+        if (digital && digital.replace(/\s/g, "").length > 40) {
+          entry.pages.push(digital);
+          entry.pageMeta.push({ source: "digital", confidence: 100 });
+        } else {
+          // (#8) Só então faz OCR da imagem rasterizada.
+          entry.usedOcr = true;
+          if (!worker) {
+            setProgress(base, "Carregando mecanismo de OCR (uma vez)…");
+            worker = await Tesseract.createWorker("por", 1, {
+              logger: (m) => {
+                if (m.status === "recognizing text") {
+                  setProgress(base, `OCR "${entry.name}" — pág. ${p}/${pdf.numPages} · ${Math.round(m.progress * 100)}%`);
+                }
+              },
+            });
+          }
+          setProgress(base, `OCR "${entry.name}" — página ${p}/${pdf.numPages}…`);
+          const img = await pageToImage(page);
+          const { data } = await worker.recognize(img);
+          entry.pages.push(data.text || "");
+          const conf = typeof data.confidence === "number" ? data.confidence : 60;
+          entry.pageMeta.push({ source: "ocr", confidence: conf });
+          entry.minConfidence = Math.min(entry.minConfidence, conf);
+        }
       }
+
       entry.fullText = entry.pages.join("\n");
       entry.detected = detectDocType(entry.fullText);
       entry.type = entry.detected;
       renderFileList();
     }
 
-    await worker.terminate();
-    setProgress(1, "Consolidando dados…");
+    if (worker) await worker.terminate();
+    setProgress(0.97, "Consolidando dados…");
 
     state.data = consolidate(state.files);
+    runValidations(state.data);           // (#3) validações
+    computeFieldConfidence(state.data);    // (#2) confiança por campo
     fillReviewForm(state.data);
     renderRawOcr(state.files);
+    saveSession();                         // (#6) persiste automaticamente
 
+    setProgress(1, "Concluído.");
     $("#step-review").classList.remove("hidden");
     $("#step-review").scrollIntoView({ behavior: "smooth" });
   } catch (err) {
     console.error(err);
     alert("Ocorreu um erro ao processar os documentos: " + err.message);
+    if (worker) { try { await worker.terminate(); } catch (_) {} }
   } finally {
     progress.classList.add("hidden");
     analyzeBtn.disabled = false;
@@ -142,23 +170,41 @@ function setProgress(ratio, text) {
   if (text) progressText.textContent = text;
 }
 
-/** Converte cada página do PDF em uma imagem (dataURL) via canvas. */
-async function pdfToImages(file, onProgress) {
-  const buf = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-  const images = [];
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const viewport = page.getViewport({ scale: 2.0 }); // escala maior = OCR melhor
-    const canvas = document.createElement("canvas");
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const ctx = canvas.getContext("2d");
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    images.push(canvas.toDataURL("image/png"));
-    if (onProgress) onProgress(i / pdf.numPages);
+/** (#9) Extrai a camada de texto digital de uma página do PDF (se existir). */
+async function extractDigitalText(page) {
+  try {
+    const content = await page.getTextContent();
+    if (!content.items || !content.items.length) return "";
+    // Reconstrói linhas a partir das posições Y dos itens.
+    const lines = new Map();
+    for (const item of content.items) {
+      const y = Math.round(item.transform[5]);
+      if (!lines.has(y)) lines.set(y, []);
+      lines.get(y).push({ x: item.transform[4], s: item.str });
+    }
+    return [...lines.entries()]
+      .sort((a, b) => b[0] - a[0])
+      .map(([, arr]) => arr.sort((a, b) => a.x - b.x).map((o) => o.s).join(" "))
+      .join("\n")
+      .replace(/[ \t]{2,}/g, " ");
+  } catch (_) {
+    return "";
   }
-  return images;
+}
+
+/** (#8) Rasteriza a página em imagem, limitando a largura para acelerar o OCR. */
+async function pageToImage(page) {
+  let viewport = page.getViewport({ scale: 2.0 });
+  const MAX_W = 2000; // (#8) downscale de scans gigantes
+  if (viewport.width > MAX_W) {
+    viewport = page.getViewport({ scale: (2.0 * MAX_W) / viewport.width });
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas.toDataURL("image/png");
 }
 
 /* ---------------------------------------------------------------------------
@@ -273,10 +319,11 @@ function consolidate(files) {
   d.criterioBarcelona = d.criterioBarcelona || "critério radiológico (1 exame de imagem trifásico)";
   d.dataRelatorio = d.dataRelatorio || today();
 
-  // Preencher AFP (datas/valores) nos campos do formulário
+  // Preencher AFP (datas/valores): mantém as 3 MAIS RECENTES, exibidas da mais antiga para a mais nova.
   const sortedAfp = dedupeAfp(d.afp).sort((a, b) => parseDate(a.data) - parseDate(b.data));
-  d.afp = sortedAfp.slice(0, 3);
-  if (!d.afpExameData && d.afp.length) d.afpExameData = d.afp[d.afp.length - 1].data;
+  const recent3 = sortedAfp.slice(-3); // 3 últimas por data
+  d.afp = recent3;
+  if (!d.afpExameData && d.afp.length) d.afpExameData = d.afp[d.afp.length - 1].data; // a mais recente
 
   // --- Consolidar exames de imagem ---
   d.imaging = dedupeImaging(d.imaging).sort((a, b) => parseDate(a.data) - parseDate(b.data));
@@ -392,14 +439,22 @@ function dedupeImaging(arr) {
 /* --- Helpers de extração --- */
 function matchName(t) {
   const patterns = [
-    /paciente\s*:?\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ'´` ]{4,})/,
-    /nome\s*:?\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ'´` ]{4,})/,
+    /paciente\s*:?\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ'´` ]{4,})/i,
+    /nome\s*:?\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ'´` ]{4,})/i,
     /sr\s*\(a\)\s*:?\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ'´` ]{4,})/i,
-    /ra\s*:\s*\S+\s*-\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ'´` ]{4,})/,
+    /ra\s*:\s*\S+\s*-\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ'´` ]{4,})/i,
   ];
+  // Palavras que marcam o início de outro campo — cortamos o nome aí.
+  const stopWords = /\b(CPF|RGCT|RG|CT|Data|Dt|DN|Sexo|Idade|C[oó]digo|Matr[ií]cula|N[uú]mero|Dr|Setor|Unidade|Prontu[aá]rio|RHHSP|RA)\b/i;
   for (const p of patterns) {
     const m = t.match(p);
-    if (m) return titleCase(m[1].split("\n")[0].trim());
+    if (m) {
+      let name = m[1].split("\n")[0];
+      const cut = name.search(stopWords);
+      if (cut > 3) name = name.slice(0, cut);
+      name = name.replace(/\s{2,}.*/, "").trim(); // corta após espaço duplo (colunas)
+      if (name.length >= 4) return titleCase(name);
+    }
   }
   return "";
 }
@@ -472,16 +527,161 @@ function escapeHtml(s) {
 }
 
 /* ---------------------------------------------------------------------------
+ * VALIDAÇÕES (#3) — CPF, MELD recalculado, AFP > 200
+ * ------------------------------------------------------------------------- */
+function runValidations(d) {
+  d.warnings = {};   // { campo: "mensagem" }  (erros/alertas)
+  d.notices = {};    // { campo: "mensagem" }  (informativos)
+
+  // CPF — dígitos verificadores
+  if (d.cpf) {
+    if (!isValidCpf(d.cpf)) d.warnings.cpf = "CPF inválido — verifique se o OCR leu os dígitos corretamente.";
+  }
+
+  // MELD-Na recalculado a partir dos laboratoriais e comparado ao extraído
+  const meldCalc = computeMeldNa(d.creatinina, d.bilirrubina, d.inr, d.sodio);
+  if (meldCalc != null) {
+    d.meldCalculado = String(meldCalc);
+    if (d.meldNa && Math.abs(Number(d.meldNa) - meldCalc) > 1) {
+      d.warnings.meldNa = `MELD-Na extraído (${d.meldNa}) difere do recalculado (${meldCalc}). Confira os laboratoriais.`;
+    } else if (!d.meldNa) {
+      d.notices.meldNa = `Sugerido pelo cálculo: MELD-Na ≈ ${meldCalc}.`;
+    }
+  }
+
+  // AFP > 200 ng/mL → suporta "critério combinado (1 exame + AFP)"
+  const afpMax = Math.max(0, ...d.afp.map((a) => parseNum(a.valor)));
+  if (afpMax > 200) {
+    d.notices.criterioBarcelona = `AFP ${afpMax} ng/mL (> 200) reforça o critério combinado (1 exame + alfa-fetoproteína).`;
+  }
+
+  // (#1) Janelas de validade dos exames (estadiamento)
+  checkExamWindow(d, "imagemData", 6, "Exame de imagem");       // até ~6 meses (Milão) / 4 (downstaging)
+  checkExamWindow(d, "tcToraxData", 12, "Tomografia de tórax");  // até 12 meses
+  checkExamWindow(d, "afpExameData", 6, "Alfa-fetoproteína");    // até ~6 meses
+}
+
+/** (#1) Marca aviso se a data do exame estiver fora da janela (em meses) a partir de hoje. */
+function checkExamWindow(d, field, months, label) {
+  const dateStr = d[field];
+  if (!dateStr) return;
+  const t = parseDate(dateStr);
+  if (!t) return;
+  const ageDays = (Date.now() - t) / 86400000;
+  const limitDays = months * 30.4;
+  if (ageDays > limitDays) {
+    d.warnings[field] = `${label}: exame de ${dateStr} pode estar fora da validade (~${months} meses). Idade: ${Math.round(ageDays / 30.4)} meses.`;
+  }
+}
+
+/** Validação de CPF (com dígitos verificadores). */
+function isValidCpf(cpf) {
+  const s = (cpf || "").replace(/\D/g, "");
+  if (s.length !== 11 || /^(\d)\1{10}$/.test(s)) return false;
+  const calc = (len) => {
+    let sum = 0;
+    for (let i = 0; i < len; i++) sum += Number(s[i]) * (len + 1 - i);
+    const r = (sum * 10) % 11;
+    return r === 10 ? 0 : r;
+  };
+  return calc(9) === Number(s[9]) && calc(10) === Number(s[10]);
+}
+
+/** MELD-Na (fórmula OPTN). Retorna inteiro 6–40 ou null se faltar dado. */
+function computeMeldNa(creat, bili, inr, na) {
+  let c = parseNum(creat), b = parseNum(bili), i = parseNum(inr), n = parseNum(na);
+  if (!c || !b || !i) return null;
+  c = clamp(c, 1.0, 4.0); b = Math.max(b, 1.0); i = Math.max(i, 1.0);
+  let meld = 0.957 * Math.log(c) + 0.378 * Math.log(b) + 1.120 * Math.log(i) + 0.643;
+  meld = Math.round(meld * 10); // escala e arredonda (×10)
+  if (n != null && n > 0) {
+    n = clamp(n, 125, 137);
+    if (meld > 11) meld = meld + 1.32 * (137 - n) - (0.033 * meld * (137 - n));
+  }
+  meld = Math.round(meld);
+  return clamp(meld, 6, 40);
+}
+
+function parseNum(v) {
+  if (v == null || v === "") return null;
+  const n = Number(String(v).replace(/\./g, "").replace(",", "."));
+  return isNaN(n) ? Number(String(v).replace(",", ".")) || null : (String(v).includes(",") ? Number(String(v).replace(",", ".")) : n);
+}
+function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+/* ---------------------------------------------------------------------------
+ * CONFIANÇA POR CAMPO (#2) — baseada na fonte (digital x OCR) e confiança OCR
+ * ------------------------------------------------------------------------- */
+function computeFieldConfidence(d) {
+  // Confiança agregada do lote: menor confiança entre páginas que precisaram de OCR.
+  let minOcr = 100, anyOcr = false;
+  for (const f of state.files) {
+    if (f.usedOcr) { anyOcr = true; minOcr = Math.min(minOcr, f.minConfidence); }
+  }
+  d.ocrUsed = anyOcr;
+  d.ocrConfidence = anyOcr ? Math.round(minOcr) : 100;
+  // Campos considerados "baixa confiança" se vieram de OCR com confiança < 85.
+  d.lowConfidence = anyOcr && minOcr < 85;
+}
+
+/* ---------------------------------------------------------------------------
+ * PERSISTÊNCIA LOCAL (#6) — salvar/recarregar sessão no navegador
+ * ------------------------------------------------------------------------- */
+const STORAGE_KEY = "hcc_report_session_v1";
+function saveSession() {
+  try {
+    const payload = { data: state.data, savedAt: new Date().toISOString() };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    updateSessionBadge();
+  } catch (_) {}
+}
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    const payload = JSON.parse(raw);
+    if (!payload || !payload.data) return false;
+    state.data = payload.data;
+    runValidations(state.data);
+    fillReviewForm(state.data);
+    $("#step-review").classList.remove("hidden");
+    $("#step-review").scrollIntoView({ behavior: "smooth" });
+    return true;
+  } catch (_) { return false; }
+}
+function clearSession() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+  updateSessionBadge();
+}
+function updateSessionBadge() {
+  const badge = $("#sessionBadge");
+  if (!badge) return;
+  const has = !!localStorage.getItem(STORAGE_KEY);
+  badge.classList.toggle("hidden", !has);
+}
+
+/* ---------------------------------------------------------------------------
  * 5) Preencher formulário editável
  * ------------------------------------------------------------------------- */
 function fillReviewForm(d) {
   const form = $("#reviewForm");
-  const set = (name, val) => {
+  const warnings = d.warnings || {};
+  const notices = d.notices || {};
+  const lowConf = !!d.lowConfidence;
+
+  const set = (name, value) => {
     const el = form.elements[name];
     if (!el) return;
-    el.value = val || "";
-    if (!val) el.classList.add("missing"); else el.classList.remove("missing");
-    el.addEventListener("input", () => el.classList.remove("missing"));
+    el.value = value || "";
+    el.classList.remove("missing", "warn", "lowconf");
+    if (!value) el.classList.add("missing");
+    else if (warnings[name]) el.classList.add("warn");
+    else if (lowConf) el.classList.add("lowconf");
+    attachFieldMessage(el, name, warnings[name], notices[name]);
+    el.addEventListener("input", () => {
+      el.classList.remove("missing", "warn", "lowconf");
+      clearFieldMessage(el);
+    });
   };
 
   set("paciente", d.paciente); set("dataNasc", d.dataNasc); set("idade", d.idade);
@@ -500,6 +700,62 @@ function fillReviewForm(d) {
   set("criterioBarcelona", d.criterioBarcelona);
   set("rnmAchados", d.rnmAchados); set("indicacao", d.indicacao);
   set("medico", d.medico); set("crm", d.crm); set("dataRelatorio", d.dataRelatorio);
+
+  renderConfidenceBanner(d);
+  renderImagingList(d);
+}
+
+/** Mostra mensagem de alerta/nota logo abaixo do campo. */
+function attachFieldMessage(el, name, warn, notice) {
+  clearFieldMessage(el);
+  const msg = warn || notice;
+  if (!msg) return;
+  const span = document.createElement("span");
+  span.className = "field-msg " + (warn ? "field-warn" : "field-notice");
+  span.textContent = (warn ? "⚠ " : "ℹ ") + msg;
+  const host = el.closest("label") || el.parentElement;
+  host.appendChild(span);
+}
+function clearFieldMessage(el) {
+  const host = el.closest("label") || el.parentElement;
+  host.querySelectorAll(".field-msg").forEach((n) => n.remove());
+}
+
+/** Banner de confiança do OCR no topo do formulário. */
+function renderConfidenceBanner(d) {
+  const box = $("#confBanner");
+  if (!box) return;
+  const warnCount = Object.keys(d.warnings || {}).length;
+  let html = "";
+  if (d.ocrUsed) {
+    const cls = d.ocrConfidence >= 85 ? "ok" : "low";
+    html += `<div class="conf ${cls}">Confiança do OCR: <strong>${d.ocrConfidence}%</strong>` +
+      (d.ocrConfidence < 85 ? " — campos podem conter erros; confira com atenção os destacados." : " — boa qualidade.") +
+      `</div>`;
+  } else {
+    html += `<div class="conf ok">Texto digital lido diretamente do PDF (sem OCR) — alta precisão.</div>`;
+  }
+  if (d.meldCalculado) html += `<div class="conf info">MELD-Na recalculado pelos laboratoriais: <strong>${d.meldCalculado}</strong>.</div>`;
+  if (warnCount) html += `<div class="conf low">${warnCount} ponto(s) de atenção destacado(s) abaixo.</div>`;
+  box.innerHTML = html;
+}
+
+/** (#14) Lista os exames de imagem detectados com a fonte. */
+function renderImagingList(d) {
+  const box = $("#imagingList");
+  if (!box) return;
+  if (!d.imaging || !d.imaging.length) { box.innerHTML = ""; return; }
+  box.innerHTML = "<h4>Exames de imagem detectados</h4>" +
+    d.imaging.map((e) => {
+      const ach = (e.achados || []).map((a) => `<li>${escapeHtml(a)}</li>`).join("");
+      return `<div class="img-card">
+        <div class="img-head"><strong>${escapeHtml(e.nome || e.tipo)}</strong>
+          <span class="tag">${escapeHtml(e.tipo)}</span>
+          <span class="img-date">${escapeHtml(e.data || "sem data")}</span></div>
+        ${e.impressao ? `<p class="img-impr"><em>Impressão:</em> ${escapeHtml(e.impressao)}</p>` : ""}
+        ${ach ? `<ul class="img-ach">${ach}</ul>` : ""}
+      </div>`;
+    }).join("");
 }
 
 function renderRawOcr(files) {
@@ -529,11 +785,35 @@ $("#editBtn").addEventListener("click", () => {
 });
 $("#printBtn").addEventListener("click", () => window.print());
 
+/* --- Exportações e sessão (#5, #6, #10) --- */
+document.addEventListener("DOMContentLoaded", () => {
+  const bind = (id, fn) => { const el = $(id); if (el) el.addEventListener("click", fn); };
+  bind("#exportCsvBtn", exportCsv);
+  bind("#exportDocxBtn", exportDocx);
+  bind("#exportCsvBtn2", exportCsv);
+  bind("#exportDocxBtn2", exportDocx);
+  bind("#clearAllBtn", () => {
+    if (confirm("Apagar todos os documentos e dados desta sessão? Esta ação não pode ser desfeita.")) {
+      state.files = []; state.data = {};
+      clearSession();
+      renderFileList();
+      $("#reviewForm")?.reset();
+      $("#step-review")?.classList.add("hidden");
+      $("#step-report")?.classList.add("hidden");
+      $("#step-upload")?.scrollIntoView({ behavior: "smooth" });
+    }
+  });
+  bind("#restoreBtn", () => { if (!loadSession()) alert("Nenhuma sessão salva encontrada."); });
+  updateSessionBadge();
+});
+
 /* ---------------------------------------------------------------------------
  * 7) Gerar o relatório (formulário HCC + carta)
  * ------------------------------------------------------------------------- */
 $("#generateBtn").addEventListener("click", () => {
   const d = readForm();
+  state.data = d;
+  saveSession();
   $("#reportOutput").innerHTML = buildReportHtml(d);
   $("#step-report").classList.remove("hidden");
   $("#step-report").scrollIntoView({ behavior: "smooth" });
@@ -542,7 +822,10 @@ $("#generateBtn").addEventListener("click", () => {
 function readForm() {
   const form = $("#reviewForm");
   const g = (n) => (form.elements[n]?.value || "").trim();
-  return {
+  // Preserva metadados que não estão no formulário (imaging, confiança…).
+  const prev = state.data || {};
+  const d = {
+    ...prev,
     paciente: g("paciente"), dataNasc: g("dataNasc"), idade: g("idade"),
     cpf: g("cpf"), rgct: g("rgct"), equipe: g("equipe"), hospital: g("hospital"),
     meldNa: g("meldNa"), meldData: g("meldData"), creatinina: g("creatinina"),
@@ -559,6 +842,7 @@ function readForm() {
     indicacao: g("indicacao"), medico: g("medico"), crm: g("crm"),
     dataRelatorio: g("dataRelatorio"),
   };
+  return d;
 }
 
 function check(on) { return on ? "☒" : "☐"; }
@@ -729,5 +1013,181 @@ function buildReportHtml(d) {
     </div>
   </div>`;
 
-  return form + letter;
+  // (#11) Rodapé de auditoria em cada relatório gerado.
+  const audit = `
+  <div class="audit-footer">
+    Documento gerado automaticamente em ${escapeHtml(today())} a partir de laudos digitalizados.
+    <strong>Conferir sempre com os laudos originais antes do envio à Central de Transplantes.</strong>
+    Ferramenta de apoio — não substitui a avaliação médica.
+  </div>`;
+
+  return form + letter + audit;
+}
+
+/* ---------------------------------------------------------------------------
+ * EXPORTAÇÕES (#5) — CSV (Excel) e Word (.docx)
+ * ------------------------------------------------------------------------- */
+function downloadBlob(filename, mime, content) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportCsv() {
+  const d = readForm();
+  const rows = [
+    ["Campo", "Valor"],
+    ["Paciente", d.paciente], ["Data de nascimento", d.dataNasc], ["Idade", d.idade],
+    ["CPF", d.cpf], ["RGCT", d.rgct], ["Equipe", d.equipe], ["Hospital", d.hospital],
+    ["MELD-Na", d.meldNa], ["MELD-Na (recalculado)", d.meldCalculado || ""], ["Data MELD", d.meldData],
+    ["Creatinina", d.creatinina], ["Bilirrubina", d.bilirrubina], ["INR", d.inr], ["Sódio", d.sodio],
+    ["AFP 1", `${d.afp[0]?.data || ""} ${d.afp[0]?.valor || ""}`.trim()],
+    ["AFP 2", `${d.afp[1]?.data || ""} ${d.afp[1]?.valor || ""}`.trim()],
+    ["AFP 3", `${d.afp[2]?.data || ""} ${d.afp[2]?.valor || ""}`.trim()],
+    ["Exame de imagem (data)", d.imagemData], ["TC tórax (data)", d.tcToraxData],
+    ["TC tórax (resultado)", d.tcToraxResultado], ["AFP exame (data)", d.afpExameData],
+    ["Quimioembolização (datas)", d.taceDatas], ["Irressecabilidade", d.irressecabilidade],
+    ["Critério de Barcelona", d.criterioBarcelona], ["Indicação", d.indicacao],
+    ["Achados RNM", (d.rnmAchados || "").replace(/\n/g, " | ")],
+    ["Médico", d.medico], ["CRM", d.crm], ["Data do relatório", d.dataRelatorio],
+  ];
+  const csv = "\uFEFF" + rows.map((r) =>
+    r.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(";")
+  ).join("\r\n");
+  const safe = (d.paciente || "paciente").replace(/[^\w]+/g, "_");
+  downloadBlob(`relatorio_hcc_${safe}.csv`, "text/csv;charset=utf-8", csv);
+}
+
+/** Gera um .docx mínimo (WordprocessingML) sem bibliotecas externas. */
+function exportDocx() {
+  const d = readForm();
+  const esc = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const P = (text, opts = {}) => {
+    const b = opts.bold ? "<w:b/>" : "";
+    const sz = opts.size ? `<w:sz w:val="${opts.size}"/>` : "";
+    const jc = opts.center ? '<w:jc w:val="center"/>' : "";
+    return `<w:p><w:pPr>${jc}</w:pPr><w:r><w:rPr>${b}${sz}</w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r></w:p>`;
+  };
+  const afpStr = d.afp.map((a) => `${a.data || ""}: ${a.valor} ng/mL`).join("; ");
+
+  const body =
+    P("SECRETARIA DE ESTADO DA SAÚDE — SISTEMA ESTADUAL DE TRANSPLANTES", { bold: true, center: true, size: 24 }) +
+    P("SITUAÇÃO ESPECIAL HCC — CARCINOMA HEPATOCELULAR", { bold: true, center: true, size: 22 }) +
+    P("") +
+    P(`Paciente: ${d.paciente}`, { bold: true }) +
+    P(`RGCT: ${d.rgct}    Equipe: ${d.equipe}    Hospital: ${d.hospital}`) +
+    P(`Data de nascimento: ${d.dataNasc}    Idade: ${d.idade}    CPF: ${d.cpf}`) +
+    P("") +
+    P("Diagnóstico (Critério de Barcelona): " + d.criterioBarcelona) +
+    P("Estadiamento:", { bold: true }) +
+    P(`• Exame de imagem — ${d.imagemData || "—"}`) +
+    P(`• Tomografia de tórax — ${d.tcToraxData || "—"} (${d.tcToraxResultado || "—"})`) +
+    P(`• Alfa-fetoproteína — ${d.afpExameData || "—"}`) +
+    P("") +
+    P("Tratamento prévio: " + (d.taceDatas ? "quimioembolização em " + d.taceDatas : "não informado")) +
+    P("Irressecabilidade: " + (d.irressecabilidade || "—")) +
+    P("") +
+    P("Carta à Central de Transplantes", { bold: true }) +
+    P(`Solicito situação especial — CHC para o(a) receptor(a) ${d.paciente}, ${d.idade ? d.idade + " anos, " : ""}RGCT: ${d.rgct}, devido ${d.indicacao || "CIRROSE + CHC"}.`) +
+    (d.rnmAchados ? d.rnmAchados.split("\n").filter(Boolean).map((l) => P("• " + l)).join("") : "") +
+    P(`• TC tórax${d.tcToraxData ? " (" + d.tcToraxData + ")" : ""}: ${d.tcToraxResultado || "—"}.`) +
+    P(`• Alfa-fetoproteína: ${afpStr || "—"}.`) +
+    P(`• MELD-Na${d.meldData ? " (" + d.meldData + ")" : ""}: ${d.meldNa || "—"}.`) +
+    (d.taceDatas ? P(`• Quimioembolização hepática em ${d.taceDatas}.`) : "") +
+    P(`• Critério de Irressecabilidade: ${d.irressecabilidade || "MELD > 10"}.`) +
+    P("") +
+    P("Atenciosamente,") +
+    P(`${d.medico || ""}${d.crm ? " — CRM " + d.crm : ""}`) +
+    P("") +
+    P(`Documento gerado em ${today()} — conferir com os laudos originais.`, { size: 16 });
+
+  const documentXml =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+    `<w:body>${body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:body></w:document>`;
+
+  const files = {
+    "[Content_Types].xml":
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+      `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+      `<Default Extension="xml" ContentType="application/xml"/>` +
+      `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
+      `</Types>`,
+    "_rels/.rels":
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
+      `</Relationships>`,
+    "word/document.xml": documentXml,
+  };
+
+  const zipBlob = buildZip(files);
+  const safe = (d.paciente || "paciente").replace(/[^\w]+/g, "_");
+  const url = URL.createObjectURL(zipBlob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `relatorio_hcc_${safe}.docx`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** ZIP sem compressão (stored) + CRC32 — suficiente para um .docx válido. */
+function buildZip(files) {
+  const enc = new TextEncoder();
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+
+  const crcTable = (() => {
+    const t = [];
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  const crc32 = (bytes) => {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const u16 = (n) => [n & 0xff, (n >>> 8) & 0xff];
+  const u32 = (n) => [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff];
+
+  for (const name of Object.keys(files)) {
+    const nameBytes = enc.encode(name);
+    const data = enc.encode(files[name]);
+    const crc = crc32(data);
+    const local = [].concat(
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0)
+    );
+    chunks.push(new Uint8Array(local), nameBytes, data);
+    const localSize = local.length + nameBytes.length + data.length;
+    central.push({ name: nameBytes, crc, size: data.length, offset });
+    offset += localSize;
+  }
+
+  const cdParts = [];
+  let cdSize = 0;
+  for (const c of central) {
+    const header = [].concat(
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0),
+      u32(c.crc), u32(c.size), u32(c.size), u16(c.name.length),
+      u16(0), u16(0), u16(0), u16(0), u32(0), u32(c.offset)
+    );
+    cdParts.push(new Uint8Array(header), c.name);
+    cdSize += header.length + c.name.length;
+  }
+  const end = [].concat(
+    u32(0x06054b50), u16(0), u16(0), u16(central.length), u16(central.length),
+    u32(cdSize), u32(offset), u16(0)
+  );
+  return new Blob([...chunks, ...cdParts, new Uint8Array(end)], {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
 }
