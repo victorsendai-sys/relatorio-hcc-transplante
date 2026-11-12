@@ -592,9 +592,15 @@ function detectDocType(text) {
   if (/valor do meld|meld\/na|situacao especial.*sem/.test(t) && /creatinina/.test(t)) return "Tela MELD (receptor)";
   if (/alfa\s*fetoprote/.test(t)) return "Alfa-fetoproteína";
   if (/escala meld|meld-na/.test(t) && /bilirrubina/.test(t)) return "Laudo laboratorial (MELD)";
-  if (/quimioembolizacao|tace|doxorrubicina|lipiodol/.test(t)) return "Quimioembolização (TACE)";
-  if (/tomografia computadorizada do torax|tc torax|tomografia.*torax/.test(t)) return "TC de tórax";
-  if (/ressonancia|rnm abdome|lirads/.test(t)) return "RNM Abdome";
+  if (/quimioembolizacao transarterial|doxorrubicina|lipiodol|radiologia intervencionista/.test(t)) return "Quimioembolização (TACE)";
+  // Imagem — TC (tomografia)
+  if (/tomografia computadorizada do torax|tc do torax|tc torax/.test(t)) return "TC de tórax";
+  if (/tomografia computadorizada|tc (?:de )?abdome/.test(t)) return "TC (abdome/outros)";
+  // Imagem — RM/RNM (ressonância)
+  if (/ressonancia magnetica|\brm abdome|\brm pelve|\bnm abdome|rnm abdome/.test(t)) return "RM/RNM (ressonância)";
+  if (/\bli-?rads\b|\blr tr\b/.test(t) && /segmento|lesoes hepaticas|figado/.test(t)) return "RM/RNM (ressonância)";
+  // Imagem — USG (ultrassonografia diagnóstica)
+  if (/ultrassonografia|ultrassom|\busg\b|ecografia/.test(t) && !/orientada por ultrassonografia/.test(t)) return "USG (ultrassom)";
   return "Documento não identificado";
 }
 
@@ -607,6 +613,7 @@ function consolidate(files) {
     equipe: "", hospital: "",
     meldNa: "", meldData: "", creatinina: "", bilirrubina: "", inr: "", sodio: "",
     afp: [], // {data, valor}
+    imaging: [], // {tipo, nome, data, impressao, achados:[...]}
     imagemData: "", tcToraxData: "", afpExameData: "", tcToraxResultado: "",
     taceDatas: "", irressecabilidade: "", criterioBarcelona: "",
     rnmAchados: "", indicacao: "",
@@ -646,18 +653,19 @@ function consolidate(files) {
     // Carta final: "Alfa-fetoproteína: 24/05/2024: 13,8 ng/mL; ..."
     extractAfpInline(t).forEach((a) => pushAfp(d, a));
 
-    // TC de tórax
-    if (/tomografia.*t[oó]rax|tc t[oó]rax/i.test(n)) {
-      takeFirst(d, "tcToraxData", grab(t, /data\s*(?:do\s*)?exame\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i));
-      const impressao = grab(t, /impress[aã]o\s*diagn[oó]stica\s*:?\s*([^\n]+)/i);
-      if (impressao) takeFirst(d, "tcToraxResultado", impressao);
-    }
+    // Exames de imagem (TC / RM-RNM / USG) — extração dedicada
+    const exam = extractImaging(t, f.detected);
+    if (exam) d.imaging.push(exam);
+
     // Carta: "TC tórax (09/06/2025): sem metástase pulmonar."
-    const tcLinha = grab(t, /tc\s*t[oó]rax\s*\((\d{2}\/\d{2}\/\d{4})\)\s*:?\s*([^\n.]+)/i);
-    if (tcLinha) {
-      const m = t.match(/tc\s*t[oó]rax\s*\((\d{2}\/\d{2}\/\d{4})\)\s*:?\s*([^\n.]+)/i);
-      if (m) { takeFirst(d, "tcToraxData", m[1]); takeFirst(d, "tcToraxResultado", m[2].trim()); }
-    }
+    const tcLinha = t.match(/tc\s*t[oó]rax\s*\((\d{2}\/\d{2}\/\d{4})\)\s*:?\s*([^\n.]+)/i);
+    if (tcLinha) { takeFirst(d, "tcToraxData", tcLinha[1]); takeFirst(d, "tcToraxResultado", tcLinha[2].trim()); }
+    // Carta: "RNM Abdome (28/09/24): ..." / "RNM ABDOME (20/05/2025): ..."
+    [...t.matchAll(/rnm?\s*abdome?\s*\((\d{2}\/\d{2}\/\d{2,4})\)\s*:?\s*([^\n]+(?:\n(?!\s*[•\-]|\s*tc\s|\s*alfa|\s*meld)[^\n]+)*)/gi)]
+      .forEach((m) => d.imaging.push({
+        tipo: "RM/RNM (ressonância)", nome: "RNM Abdome", data: expandYear(m[1]),
+        impressao: "", achados: [m[2].replace(/\s+/g, " ").trim()], fromLetter: true,
+      }));
 
     // Quimioembolização (TACE) — datas
     if (/quimioembolizacao|tace/i.test(n)) {
@@ -675,10 +683,6 @@ function consolidate(files) {
     const motivo = grab(t, /devido\s*([^.\n]+)/i) || grab(t, /ref\.?\s*:?\s*inclus[aã]o[^\n]*-\s*([^\n]+)/i);
     if (motivo) takeFirst(d, "indicacao", motivo.replace(/\s+/g, " ").trim());
 
-    // Achados RNM
-    const rnm = [...t.matchAll(/rnm?\s*abdom[^\n]*\n?[^\n]*/gi)].map((m) => m[0].replace(/\s+/g, " ").trim());
-    if (rnm.length) d.rnmAchados = (d.rnmAchados ? d.rnmAchados + "\n" : "") + rnm.join("\n");
-
     // Médico / CRM
     takeFirst(d, "medico", grab(t, /assinado por\s*:?\s*([A-Za-zÀ-ÿ ]+?)\s*(?:crbm|crm|$)/i)
       || (/adriano miziara gonzalez/i.test(t) ? "Adriano Miziara Gonzalez" : ""));
@@ -693,10 +697,117 @@ function consolidate(files) {
   // Preencher AFP (datas/valores) nos campos do formulário
   const sortedAfp = dedupeAfp(d.afp).sort((a, b) => parseDate(a.data) - parseDate(b.data));
   d.afp = sortedAfp.slice(0, 3);
-  // imagemData / afpExameData defaults a partir dos dados achados
   if (!d.afpExameData && d.afp.length) d.afpExameData = d.afp[d.afp.length - 1].data;
 
+  // --- Consolidar exames de imagem ---
+  d.imaging = dedupeImaging(d.imaging).sort((a, b) => parseDate(a.data) - parseDate(b.data));
+
+  // TC de tórax: data + impressão (preferir laudo de verdade; senão a carta)
+  const tcTorax = d.imaging.filter((e) => /t[oó]rax/i.test(e.nome) || (/tc/i.test(e.tipo || "") && /t[oó]rax/i.test(e.nome || "")));
+  const tc = d.imaging.find((e) => /tomografia.*t[oó]rax|tc.*t[oó]rax|t[oó]rax/i.test(e.nome) && !e.fromLetter)
+    || d.imaging.find((e) => /t[oó]rax/i.test(e.nome));
+  if (tc) {
+    takeFirst(d, "tcToraxData", tc.data);
+    takeFirst(d, "tcToraxResultado", tc.impressao || (tc.achados && tc.achados[0]) || "");
+  }
+
+  // Exame de imagem (estadiamento): data da RM/RNM/USG mais recente
+  const rmExams = d.imaging.filter((e) => /ress|rm\/rnm|rnm|\brm\b/i.test(e.tipo || "") || /abdome|pelve|ressonancia|rnm/i.test(e.nome || ""));
+  const latestRm = rmExams.length ? rmExams[rmExams.length - 1] : null;
+  if (latestRm) takeFirst(d, "imagemData", latestRm.data);
+
+  // Montar o texto de achados da RNM para a carta (usa achados estruturados)
+  if (!d.rnmAchados) {
+    const lines = [];
+    rmExams.forEach((e) => {
+      const head = `${e.nome || "RNM Abdome"}${e.data ? " (" + e.data + ")" : ""}:`;
+      const body = (e.achados && e.achados.length) ? e.achados.join(" ") : (e.impressao || "");
+      if (body) lines.push(`${head} ${body}`);
+    });
+    d.rnmAchados = lines.join("\n");
+  }
+
   return d;
+}
+
+/* --- Extração de um laudo de imagem (TC / RM-RNM / USG) --- */
+function extractImaging(t, detected) {
+  const n = norm(t);
+  const isImaging = /tomografia|ressonancia magnetica|\brm\b|rnm|ultrassonografia|ultrassom|\busg\b/.test(n)
+    && !/quimioembolizacao transarterial|radiologia intervencionista|biopsia de linfonodo/.test(n);
+  if (!isImaging) return null;
+
+  // Nome do exame: campo "Exame:" ou o título do laudo
+  let nome = grab(t, /exame\s*:?\s*([A-Za-zÀ-ÿ .\/]+?)(?:\n|n[uú]mero|data|c[oó]digo)/i);
+  if (!nome) {
+    nome = grab(t, /\n\s*(tomografia computadorizada[^\n]*|ressonancia magnetica[^\n]*|ultrassonografia[^\n]*)/i);
+  }
+  nome = (nome || "").replace(/\s+/g, " ").trim();
+
+  // Tipo
+  let tipo = "Imagem";
+  if (/tomografia|tc\b/i.test(nome) || /tomografia computadorizada/i.test(n)) tipo = "TC (tomografia)";
+  if (/ressonancia|\brm\b|rnm/i.test(nome) || /ressonancia magnetica/i.test(n)) tipo = "RM/RNM (ressonância)";
+  if (/ultrass|usg|ecografia/i.test(nome)) tipo = "USG (ultrassom)";
+
+  // Data do exame: tenta vários rótulos (Data Exame / Data do Exame / Data do Pedido / Coleta)
+  const data =
+    grab(t, /data\s*(?:do\s*)?exame\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) ||
+    grab(t, /data\s*(?:do\s*)?pedido\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) ||
+    grab(t, /data\s*(?:de\s*)?coleta\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) ||
+    grab(t, /coleta\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) || "";
+
+  // Impressão / Opinião / Impressão diagnóstica
+  const impressao =
+    grabBlock(t, /impress[aã]o\s*diagn[oó]stica\s*:?/i) ||
+    grabBlock(t, /\bopini[aã]o\s*:?/i) ||
+    grabBlock(t, /conclus[aã]o\s*:?/i) || "";
+
+  // Achados estruturados (segmentos / LI-RADS) — captura linhas com "Segmento ... LI-RADS"
+  const achados = [];
+  [...t.matchAll(/segmento\s+[^\n]*?(?:li-?rads|lr\s*tr)[^\n]*/gi)]
+    .forEach((m) => achados.push(m[0].replace(/\s+/g, " ").trim()));
+  // Se não há segmentos, usa o bloco ANÁLISE como achado principal
+  if (!achados.length) {
+    const analise = grabBlock(t, /an[aá]lise\s*:?/i) || grabBlock(t, /descri[cç][aã]o\s*:?/i);
+    if (analise) achados.push(firstSentences(analise, 2));
+  }
+
+  return { tipo, nome: nome || tipo, data, impressao: impressao.replace(/\s+/g, " ").trim(), achados };
+}
+
+/** Captura o bloco de texto após um rótulo até o próximo rótulo em MAIÚSCULAS ou dupla quebra. */
+function grabBlock(t, labelRe) {
+  const m = t.match(labelRe);
+  if (!m) return "";
+  const start = m.index + m[0].length;
+  const rest = t.slice(start);
+  // para no próximo rótulo: título em MAIÚSCULAS com ":" OU rótulos conhecidos de seção
+  const stopUpper = rest.search(/\n\s*[A-ZÀ-Ý][A-ZÀ-Ý \-]{3,}\s*:/);
+  const stopLabel = rest.search(/\n?\s*(impress[aã]o\s*diagn[oó]stica|an[aá]lise|opini[aã]o|conclus[aã]o|t[eé]cnica|metodologia)\s*:/i);
+  const stops = [stopUpper, stopLabel].filter((x) => x > -1);
+  const stop = stops.length ? Math.min(...stops) : -1;
+  const block = stop > -1 ? rest.slice(0, stop) : rest;
+  return block.replace(/\s+/g, " ").trim();
+}
+
+function firstSentences(s, n) {
+  const parts = s.split(/(?<=[.;])\s+/).slice(0, n);
+  return parts.join(" ").trim();
+}
+
+function dedupeImaging(arr) {
+  const seen = new Map();
+  for (const e of arr) {
+    const key = (e.tipo || "") + "|" + (e.data || "") + "|" + (e.nome || "").slice(0, 20);
+    const existing = seen.get(key);
+    // prefere a versão com achados/impressão mais ricos (laudo real) sobre a da carta
+    if (!existing || ((e.achados?.join("").length || 0) + (e.impressao?.length || 0)) >
+                     ((existing.achados?.join("").length || 0) + (existing.impressao?.length || 0))) {
+      seen.set(key, e);
+    }
+  }
+  return [...seen.values()];
 }
 
 /* --- Helpers de extração --- */
