@@ -59,10 +59,24 @@ Ferramenta de **apoio**. O reconhecimento automático pode conter erros; todos o
 valores devem ser **conferidos por um profissional** antes do envio à Central de
 Transplantes.
 
+## Recursos
+
+- **Leitura de texto digital + OCR sob demanda:** páginas com texto digital são lidas direto do PDF (rápido e exato); só as digitalizadas passam por OCR.
+- **Detecção de tipos:** tela MELD, laudo laboratorial, alfa-fetoproteína, TACE, **TC (tomografia)**, **RM/RNM (ressonância)** e **USG (ultrassom)**.
+- **Extração estruturada de imagem:** nome, data, impressão/opinião e achados por segmento/LI-RADS.
+- **Confiança por campo (#2):** indica a confiança do OCR e destaca campos a conferir.
+- **Validações clínicas (#3):** CPF (dígitos verificadores), MELD-Na recalculado pelos laboratoriais, alerta de AFP > 200 ng/mL.
+- **Janelas de validade (#1):** avisa quando um exame pode estar fora do prazo do estadiamento.
+- **Exportações (#5):** CSV (Excel) e Word (.docx) — ambos gerados no navegador, sem bibliotecas externas.
+- **Sessão local (#6):** salva/recupera os dados no navegador (localStorage), sem enviar nada.
+- **Privacidade (#10):** botão "Apagar tudo" e processamento 100% local.
+- **Rodapé de auditoria (#11):** cada relatório traz data de geração e aviso de conferência.
+
 ## Arquivos
 
 | Arquivo | Função |
 |---|---|
 | `index.html` | Interface (upload, formulário, relatório) |
 | `styles.css` | Estilo + regras de impressão |
-| `app.js` | OCR, detecção, extração e geração do relatório |
+| `app.js` | OCR/texto digital, detecção, extração, validações, exportação e geração do relatório |
+| `relatorio-hcc-standalone.html` | Versão em arquivo único (abrir direto no navegador) |
