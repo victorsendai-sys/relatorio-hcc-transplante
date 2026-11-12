@@ -31,8 +31,9 @@
       <h2><span class="step-num">1</span> Enviar documentos (PDF)</h2>
       <p class="hint">
         Envie os exames e laudos do paciente. O sistema reconhece automaticamente:
-        tela MELD, laudo laboratorial, alfa-fetoproteína, quimioembolização (TACE)
-        e tomografia de tórax.
+        tela MELD, laudo laboratorial, alfa-fetoproteína, quimioembolização (TACE),
+        tomografia (TC), ressonância (RM/RNM) e ultrassonografia (USG).
+        PDFs com texto digital são lidos diretamente (mais rápido); digitalizados passam por OCR.
       </p>
 
       <label id="dropzone" class="dropzone" for="fileInput">
@@ -50,7 +51,11 @@
         <button id="analyzeBtn" class="btn btn-primary" disabled>
           🔍 Analisar documentos
         </button>
-        <button id="clearBtn" class="btn btn-ghost" disabled>Limpar</button>
+        <button id="clearBtn" class="btn btn-ghost" disabled>Limpar lista</button>
+        <button id="restoreBtn" class="btn btn-ghost" type="button">
+          ↩️ Restaurar sessão salva <span id="sessionBadge" class="session-badge hidden">•</span>
+        </button>
+        <button id="clearAllBtn" class="btn btn-danger" type="button">🗑️ Apagar tudo</button>
       </div>
 
       <div id="progress" class="progress hidden">
@@ -65,8 +70,12 @@
       <p class="hint">
         O reconhecimento de documentos digitalizados pode conter erros.
         <strong>Confira cada campo</strong> e corrija o que for necessário antes de gerar o relatório.
-        Os campos em <span class="tag tag-warn">amarelo</span> não foram encontrados automaticamente.
+        Legenda: <span class="tag tag-warn">amarelo</span> não encontrado ·
+        <span class="tag tag-err">laranja</span> atenção/possível erro de OCR.
       </p>
+
+      <div id="confBanner" class="conf-banner"></div>
+      <div id="imagingList" class="imaging-list"></div>
 
       <form id="reviewForm">
         <fieldset>
@@ -153,6 +162,8 @@
 
       <div class="actions">
         <button id="generateBtn" class="btn btn-primary" type="button">📝 Gerar relatório</button>
+        <button id="exportCsvBtn" class="btn btn-ghost" type="button">📊 Exportar CSV</button>
+        <button id="exportDocxBtn" class="btn btn-ghost" type="button">📄 Exportar Word</button>
         <button id="backBtn" class="btn btn-ghost" type="button">← Voltar aos documentos</button>
       </div>
 
@@ -167,6 +178,8 @@
       <h2><span class="step-num">3</span> Relatório gerado</h2>
       <div class="actions no-print">
         <button id="printBtn" class="btn btn-primary" type="button">🖨️ Imprimir / Salvar PDF</button>
+        <button id="exportDocxBtn2" class="btn btn-ghost" type="button">📄 Exportar Word</button>
+        <button id="exportCsvBtn2" class="btn btn-ghost" type="button">📊 Exportar CSV</button>
         <button id="editBtn" class="btn btn-ghost" type="button">← Editar dados</button>
       </div>
       <div id="reportOutput" class="report"></div>
