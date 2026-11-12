@@ -457,53 +457,128 @@ function buildReportHtml(d) {
   const afpStr = d.afp.map((a) => `${val(a.data, "")}: ${a.valor} ng/mL`).join("; ");
   const meldGt10 = /meld\s*>?\s*1[0-9]|meld\s*>\s*10/i.test(d.irressecabilidade) || Number(d.meldNa) > 10;
 
-  // --- Documento 1: formulário oficial ---
+  // Marcações dos checkboxes do Diagnóstico (Critério de Barcelona)
+  const cb = d.criterioBarcelona || "";
+  const cbAnatomo = /anatomopatol/i.test(cb);
+  const cbRadio2  = /2\s*exames|radiol[oó]gico\s*\(?\s*2/i.test(cb);
+  const cbTrifasico = /trif[aá]sico|1\s*exame\s*(?:de\s*)?imagem/i.test(cb) && !cbRadio2;
+  const cbCombinado = /combinado|alfa\s*feto/i.test(cb);
+  const yesTrat = !!d.taceDatas;
+
+  // --- Documento 1: formulário oficial (reprodução fiel) ---
   const form = `
-  <div class="doc-sheet">
-    <h3 class="gov">SECRETARIA DE ESTADO DA SAÚDE</h3>
-    <p class="gov-sub">SISTEMA ESTADUAL DE TRANSPLANTES — ctrans1@saude.sp.gov.br</p>
+  <div class="doc-sheet form-sheet">
+
+    <!-- Cabeçalho oficial -->
+    <div class="gov-header">
+      <div class="gov-seal">SES</div>
+      <div class="gov-title">
+        <h3 class="gov">SECRETARIA DE ESTADO DA SAÚDE</h3>
+        <p class="gov-line">SISTEMA ESTADUAL DE TRANSPLANTES</p>
+        <p class="gov-contact">Home page: http://ctxses.saude.sp.gov.br  /  http://www.saude.sp.gov.br</p>
+        <p class="gov-contact">E-mail: ctrans1@saude.sp.gov.br</p>
+      </div>
+      <div class="gov-versao">VERSÃO 3</div>
+    </div>
+
     <p class="form-title">SITUAÇÃO ESPECIAL HCC<br>CARCINOMA HEPATOCELULAR</p>
 
-    <table class="form">
-      <tr><td class="lbl">Paciente</td><td>${val(d.paciente)}</td></tr>
-      <tr><td class="lbl">RGCT</td><td>${val(d.rgct)} <span style="color:#888">(nº do registro na Central de Transplantes)</span></td></tr>
-      <tr><td class="lbl">Equipe</td><td>${val(d.equipe)}</td></tr>
-      <tr><td class="lbl">Hospital</td><td>${val(d.hospital)}</td></tr>
+    <!-- Identificação -->
+    <table class="form ident">
+      <tr><td class="lbl">Paciente:</td><td class="fill">${val(d.paciente)}</td></tr>
+      <tr><td class="lbl">RGCT:</td><td class="fill">${val(d.rgct)} <span class="note">(n.º do registro na Central de Transplantes)</span></td></tr>
+      <tr><td class="lbl">Equipe:</td><td class="fill">${val(d.equipe)}</td></tr>
+      <tr><td class="lbl">Hospital:</td><td class="fill">${val(d.hospital)}</td></tr>
     </table>
 
-    <div class="box">
-      <h4>Diagnóstico (Critério de Barcelona)</h4>
-      <p class="check">${check(/anatomopatol/i.test(d.criterioBarcelona))} critério anatomopatológico</p>
-      <p class="check">${check(/2\s*exames|radiol.*2/i.test(d.criterioBarcelona))} critério radiológico (2 exames)</p>
-      <p class="check">${check(/trif[aá]sico|1\s*exame/i.test(d.criterioBarcelona))} critério radiológico (1 exame de imagem trifásico)</p>
-      <p class="check">${check(/combinado|alfa\s*feto/i.test(d.criterioBarcelona))} critério combinado (1 exame + Alfa fetoproteína)</p>
+    <!-- Critérios de inclusão (texto fixo) -->
+    <div class="criterios">
+      <p><strong>Critério para inclusão em lista de espera:</strong> Paciente portador de carcinoma hepatocelular, como
+      complicação da doença hepática crônica, sem metástase, restrito ao fígado com nódulo único de até 5 cm ou até três
+      nódulos de 3 cm e a ausência de metástases, com estadiamento obrigatório por mapeamento ósseo e tomografia de tórax.</p>
+      <p><strong>Critério para inclusão em situação especial:</strong> Carcinoma hepatocelular maior ou igual a 2cm dentro
+      dos critérios de Milão (fígado cirrótico com nódulo único de até 5 cm ou até 3 nódulos de até 3 cm de diâmetro cada,
+      ausência de trombose neoplásica do sistema porta), com diagnóstico baseado nos critérios de Barcelona e sem indicação
+      de ressecção.</p>
     </div>
 
-    <div class="box">
-      <h4>Estadiamento</h4>
-      <p class="check">${check(!!d.imagemData || !!d.afp.length)} Exame de imagem &nbsp; Data: ${val(d.imagemData, "____/____/____")}</p>
-      <p class="check">${check(!!d.tcToraxData)} Tomografia de tórax &nbsp; Data: ${val(d.tcToraxData, "____/____/____")}</p>
-      <p class="check">${check(!!d.afpExameData)} Exame de alfa-fetoproteína &nbsp; Data: ${val(d.afpExameData, "____/____/____")}</p>
-    </div>
-
-    <div class="box">
-      <h4>Tratamento prévio: ${check(!!d.taceDatas)} sim &nbsp; ${check(!d.taceDatas)} não</h4>
-      <p class="check">☐ ressecção &nbsp; ☐ quimioterapia &nbsp; ☐ ablação</p>
-      <p class="check">${check(!!d.taceDatas)} quimioembolização &nbsp; ☐ alcoolização</p>
-    </div>
-
-    <div class="box">
-      <h4>Relatório médico com justificativa da Irressecabilidade</h4>
-      <p class="check">${check(meldGt10)} MELD &gt; 10 &nbsp;&nbsp; ☐ Child B ou C &nbsp;&nbsp; ☐ Na⁺ &lt; 135</p>
-      <p class="check">☐ Ressecções de mais de 2 segmentos &nbsp;&nbsp; ☐ Tumores múltiplos</p>
-    </div>
-
-    <table class="form">
+    <!-- Diagnóstico (duas colunas) -->
+    <table class="form twocol">
       <tr>
-        <td class="lbl">Assinatura e Carimbo do Médico</td>
-        <td>${val(d.medico)}${d.crm ? " — CRM " + escapeHtml(d.crm) : ""}</td>
-        <td class="lbl">Data</td>
-        <td>${val(d.dataRelatorio)}</td>
+        <td class="col-left">
+          <h4>Diagnóstico (Critério de Barcelona)</h4>
+          <p class="check">${check(cbAnatomo)} critério anatomopatológico</p>
+          <p class="check">${check(cbRadio2)} critério radiológico ( 2 exames )</p>
+          <p class="check">${check(cbTrifasico)} critério radiológico ( 1 exame de imagem trifásico )</p>
+          <p class="check">${check(cbCombinado)} critério combinado ( 1 exame + Alfa fetoproteína )</p>
+        </td>
+        <td class="col-right">
+          Anatomopatológico ou duas (2) imagens coincidentes entre 4 técnicas (ultrassonografia com Doppler ou contraste
+          por microbolhas, ressonância, tomografia e arteriografia) que mostre lesão focal ≥ 2 cm com hipervascularização
+          arterial ou 1 exame de imagem trifásico (tomografia computadorizada helicoidal multislice, ressonância magnética,
+          ultrassonografia com contraste por microbolhas) demonstrando lesão focal ≥ 2cm com padrão hemodinâmico de
+          hipervascularização arterial e depuração rápida do contraste nas fases portal ou de equilíbrio (<em>washout</em>)
+          ou 1 imagem com tumor hipervascular +AFP &gt; 200 ng/ml. Encaminhar relatório médico e laudo dos exames.
+        </td>
+      </tr>
+    </table>
+
+    <!-- Estadiamento (duas colunas) -->
+    <table class="form twocol">
+      <tr>
+        <td class="col-left">
+          <h4>Estadiamento</h4>
+          <p class="check stage">${check(!!d.imagemData)} Exame de imagem <span class="data">Data: ${val(d.imagemData, "____/____/____")}</span></p>
+          <p class="check stage">${check(!!d.tcToraxData)} Tomografia de tórax <span class="data">Data: ${val(d.tcToraxData, "____/____/____")}</span></p>
+          <p class="check stage">${check(!!d.afpExameData)} Exame de alfa-fetoproteína <span class="data">Data: ${val(d.afpExameData, "____/____/____")}</span></p>
+        </td>
+        <td class="col-right">
+          Para fins de estadiamento nódulos com diâmetro inferior a 2 cm são considerados de natureza indeterminada.
+          Tumor dentro do critério de Milão: exame de imagem de até 06 meses, tomografia de tórax de até 1 ano e exame de
+          alfa-fetoproteína de até 06 meses. Downstaging – exame de imagem de até 04 meses, tomografia de tórax de até 06
+          meses e exame de alfa-fetoproteína de até 04 meses.
+        </td>
+      </tr>
+    </table>
+
+    <!-- Tratamento prévio (duas colunas) -->
+    <table class="form twocol">
+      <tr>
+        <td class="col-left">
+          <h4>Tratamento prévio: sim ${check(yesTrat)} &nbsp; não ${check(!yesTrat)} &nbsp; se sim:</h4>
+          <p class="check">☐ ressecção &nbsp;&nbsp; ☐ quimioterapia &nbsp;&nbsp; ☐ ablação</p>
+          <p class="check">${check(yesTrat)} quimioembolização &nbsp;&nbsp; ☐ alcoolização</p>
+        </td>
+        <td class="col-right">
+          Relatório médico explicitando se houve ou não tratamento prévio. Caso tenha tratamento prévio, encaminhar laudo
+          do(s) exame(s) prévio ao tratamento.
+        </td>
+      </tr>
+    </table>
+
+    <!-- Irressecabilidade -->
+    <div class="irresec">
+      <p>☐ Relatório médico com a justificativa da <strong>Irressecabilidade</strong>. Indique pelo menos um dos motivos abaixo:</p>
+      <table class="irresec-grid">
+        <tr>
+          <td class="check">${check(meldGt10)} MELD&gt;10</td>
+          <td class="check">☐ Child B ou C</td>
+          <td class="check">☐ Na⁺ &lt; 135</td>
+        </tr>
+        <tr>
+          <td class="check">☐ Ressecções de mais de 2 segmentos</td>
+          <td class="check" colspan="2">☐ Tumores múltiplos (mais de 1 nódulo em segmentos distintos)</td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- Assinatura -->
+    <table class="form sign">
+      <tr>
+        <td class="lbl">Assinatura e Carimbo do Médico:</td>
+        <td class="fill">${val(d.medico, "")}${d.crm ? "<br><span class='note'>CRM " + escapeHtml(d.crm) + "</span>" : ""}</td>
+        <td class="lbl data-lbl">Data:</td>
+        <td class="fill">${val(d.dataRelatorio)}</td>
       </tr>
     </table>
   </div>`;
