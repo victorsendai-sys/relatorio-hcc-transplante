@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Relatório HCC — Rede de Transplantes</title>
+  <meta name="description" content="Leitura e análise de documentos médicos para geração do relatório de Situação Especial HCC (carcinoma hepatocelular) — 100% no navegador." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="wrap">
+      <h1>📄 Relatório de Situação Especial — HCC</h1>
+      <p class="subtitle">
+        Leitura e análise de documentos médicos · geração do relatório para a
+        Central de Transplantes · <strong>tudo processado no seu navegador</strong>
+      </p>
+    </div>
+  </header>
+
+  <!-- Privacy banner -->
+  <div class="privacy-banner wrap">
+    🔒 <strong>Privacidade:</strong> nenhum documento é enviado para a internet.
+    Toda a leitura (OCR) e análise acontece localmente no seu computador.
+  </div>
+
+  <main class="wrap">
+
+    <!-- STEP 1: Upload -->
+    <section class="card" id="step-upload">
+      <h2><span class="step-num">1</span> Enviar documentos (PDF)</h2>
+      <p class="hint">
+        Envie os exames e laudos do paciente. O sistema reconhece automaticamente:
+        tela MELD, laudo laboratorial, alfa-fetoproteína, quimioembolização (TACE)
+        e tomografia de tórax.
+      </p>
+
+      <label id="dropzone" class="dropzone" for="fileInput">
+        <div class="dropzone-inner">
+          <span class="dz-icon">⬆️</span>
+          <span class="dz-text">Clique para escolher ou arraste os PDFs aqui</span>
+          <span class="dz-sub">PDFs digitais ou digitalizados (com OCR)</span>
+        </div>
+        <input type="file" id="fileInput" accept="application/pdf" multiple hidden />
+      </label>
+
+      <ul id="fileList" class="file-list"></ul>
+
+      <div class="actions">
+        <button id="analyzeBtn" class="btn btn-primary" disabled>
+          🔍 Analisar documentos
+        </button>
+        <button id="clearBtn" class="btn btn-ghost" disabled>Limpar</button>
+      </div>
+
+      <div id="progress" class="progress hidden">
+        <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+        <p id="progressText" class="progress-text">Preparando…</p>
+      </div>
+    </section>
+
+    <!-- STEP 2: Review extracted data -->
+    <section class="card hidden" id="step-review">
+      <h2><span class="step-num">2</span> Conferir e corrigir os dados extraídos</h2>
+      <p class="hint">
+        O reconhecimento de documentos digitalizados pode conter erros.
+        <strong>Confira cada campo</strong> e corrija o que for necessário antes de gerar o relatório.
+        Os campos em <span class="tag tag-warn">amarelo</span> não foram encontrados automaticamente.
+      </p>
+
+      <form id="reviewForm">
+        <fieldset>
+          <legend>Identificação do paciente</legend>
+          <div class="grid">
+            <label>Paciente <input name="paciente" type="text" /></label>
+            <label>Data de nascimento <input name="dataNasc" type="text" placeholder="dd/mm/aaaa" /></label>
+            <label>Idade <input name="idade" type="text" /></label>
+            <label>CPF <input name="cpf" type="text" /></label>
+            <label>RGCT (registro na Central) <input name="rgct" type="text" /></label>
+            <label>Equipe <input name="equipe" type="text" /></label>
+            <label>Hospital <input name="hospital" type="text" /></label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Escore MELD / MELD-Na</legend>
+          <div class="grid">
+            <label>Valor MELD-Na <input name="meldNa" type="text" /></label>
+            <label>Data do exame MELD <input name="meldData" type="text" placeholder="dd/mm/aaaa" /></label>
+            <label>Creatinina (mg/dL) <input name="creatinina" type="text" /></label>
+            <label>Bilirrubina total (mg/dL) <input name="bilirrubina" type="text" /></label>
+            <label>INR <input name="inr" type="text" /></label>
+            <label>Sódio (mEq/L) <input name="sodio" type="text" /></label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Alfa-fetoproteína (evolução)</legend>
+          <div class="grid">
+            <label>AFP — data 1 / valor
+              <div class="pair"><input name="afp1Data" type="text" placeholder="dd/mm/aaaa" /><input name="afp1Valor" type="text" placeholder="ng/mL" /></div>
+            </label>
+            <label>AFP — data 2 / valor
+              <div class="pair"><input name="afp2Data" type="text" placeholder="dd/mm/aaaa" /><input name="afp2Valor" type="text" placeholder="ng/mL" /></div>
+            </label>
+            <label>AFP — data 3 / valor
+              <div class="pair"><input name="afp3Data" type="text" placeholder="dd/mm/aaaa" /><input name="afp3Valor" type="text" placeholder="ng/mL" /></div>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Estadiamento (datas dos exames)</legend>
+          <div class="grid">
+            <label>Exame de imagem — data <input name="imagemData" type="text" placeholder="dd/mm/aaaa" /></label>
+            <label>Tomografia de tórax — data <input name="tcToraxData" type="text" placeholder="dd/mm/aaaa" /></label>
+            <label>Alfa-fetoproteína — data <input name="afpExameData" type="text" placeholder="dd/mm/aaaa" /></label>
+            <label class="full">TC de tórax — resultado
+              <input name="tcToraxResultado" type="text" placeholder="ex.: sem metástase pulmonar" /></label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Tratamento prévio / Irressecabilidade</legend>
+          <div class="grid">
+            <label class="full">Quimioembolização (TACE) — datas
+              <input name="taceDatas" type="text" placeholder="ex.: 23/08/2024 e 13/02/2025" /></label>
+            <label>Critério de irressecabilidade
+              <input name="irressecabilidade" type="text" placeholder="ex.: MELD > 10" /></label>
+            <label class="full">Diagnóstico (Critério de Barcelona)
+              <input name="criterioBarcelona" type="text" placeholder="ex.: critério radiológico (1 exame de imagem trifásico)" /></label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Achados de imagem (RNM Abdome) — texto livre</legend>
+          <label class="full">
+            <textarea name="rnmAchados" rows="5" placeholder="Cole/edite os achados das RNM de abdome (segmentos, medidas, LIRADS, washout…)"></textarea>
+          </label>
+          <label class="full">Motivo / indicação
+            <input name="indicacao" type="text" placeholder="ex.: CIRROSE HCV + CHC downstaging" /></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Assinatura</legend>
+          <div class="grid">
+            <label>Médico responsável <input name="medico" type="text" /></label>
+            <label>CRM <input name="crm" type="text" /></label>
+            <label>Data do relatório <input name="dataRelatorio" type="text" placeholder="dd/mm/aaaa" /></label>
+          </div>
+        </fieldset>
+      </form>
+
+      <div class="actions">
+        <button id="generateBtn" class="btn btn-primary" type="button">📝 Gerar relatório</button>
+        <button id="backBtn" class="btn btn-ghost" type="button">← Voltar aos documentos</button>
+      </div>
+
+      <details class="raw-ocr">
+        <summary>Ver texto bruto reconhecido (OCR) por documento</summary>
+        <div id="rawOcr"></div>
+      </details>
+    </section>
+
+    <!-- STEP 3: Report -->
+    <section class="card hidden" id="step-report">
+      <h2><span class="step-num">3</span> Relatório gerado</h2>
+      <div class="actions no-print">
+        <button id="printBtn" class="btn btn-primary" type="button">🖨️ Imprimir / Salvar PDF</button>
+        <button id="editBtn" class="btn btn-ghost" type="button">← Editar dados</button>
+      </div>
+      <div id="reportOutput" class="report"></div>
+    </section>
+
+  </main>
+
+  <footer class="app-footer no-print">
+    <div class="wrap">
+      <p>
+        Ferramenta de apoio — não substitui a conferência médica. Os valores são
+        extraídos automaticamente e devem ser validados por um profissional antes do envio à Central de Transplantes.
+      </p>
+    </div>
+  </footer>
+
+  <!-- Libraries loaded from CDN; the DOCUMENTS themselves never leave the browser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
