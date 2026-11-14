@@ -13,8 +13,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
 
 // --- Estado da aplicação ---
 const state = {
-  files: [],        // { file, name, type, pages: [text], fullText, detected }
+  files: [],        // { file, name, type, pages: [text], fullText, detected, pageMeta }
   data: {},         // campos extraídos/consolidados
+  reports: [],      // (#1) relatórios individuais segmentados
+  ocrWorker: null,  // worker reutilizável p/ "Forçar OCR"
 };
 
 // --- Atalhos de DOM ---
@@ -98,54 +100,31 @@ async function runAnalysis() {
       setProgress(base, `Lendo "${entry.name}" (${fi + 1}/${totalFiles})…`);
 
       entry.pages = [];
-      entry.pageMeta = []; // { source, confidence, image, width, height, words:[{text,x,y,w,h}] }
+      entry.pageMeta = []; // metadados por página (ver processPage)
       entry.minConfidence = 100;
       entry.usedOcr = false;
 
       const pdf = await pdfjsLib.getDocument({ data: await entry.file.arrayBuffer() }).promise;
+      entry.numPages = pdf.numPages;
 
       for (let p = 1; p <= pdf.numPages; p++) {
         const page = await pdf.getPage(p);
-
-        // Rasteriza a página para exibição lado a lado (sempre).
-        const render = await pageToImage(page);
-
-        // (#9) Primeiro tenta a camada de texto digital — rápido, exato e com posições.
-        const digital = await extractDigitalText(page, render.scale);
-        if (digital.text && digital.text.replace(/\s/g, "").length > 40) {
-          entry.pages.push(digital.text);
-          entry.pageMeta.push({
-            source: "digital", confidence: 100,
-            image: render.image, width: render.width, height: render.height,
-            words: digital.words,
-          });
-        } else {
-          // (#8) Só então faz OCR da imagem rasterizada — com caixas de palavras.
-          entry.usedOcr = true;
+        const ensureWorker = async () => {
           if (!worker) {
             setProgress(base, "Carregando mecanismo de OCR (uma vez)…");
             worker = await Tesseract.createWorker("por", 1, {
               logger: (m) => {
-                if (m.status === "recognizing text") {
+                if (m.status === "recognizing text")
                   setProgress(base, `OCR "${entry.name}" — pág. ${p}/${pdf.numPages} · ${Math.round(m.progress * 100)}%`);
-                }
               },
             });
           }
-          setProgress(base, `OCR "${entry.name}" — página ${p}/${pdf.numPages}…`);
-          const { data } = await worker.recognize(render.image, {}, { blocks: true, text: true });
-          entry.pages.push(data.text || "");
-          const conf = typeof data.confidence === "number" ? data.confidence : 60;
-          const words = collectWords(data).map((w) => {
-            const b = w.bbox || w;
-            return { text: w.text || "", x: b.x0, y: b.y0, w: b.x1 - b.x0, h: b.y1 - b.y0 };
-          }).filter((w) => w.text && isFinite(w.x) && isFinite(w.y) && w.w > 0 && w.h > 0);
-          entry.pageMeta.push({
-            source: "ocr", confidence: conf,
-            image: render.image, width: render.width, height: render.height, words,
-          });
-          entry.minConfidence = Math.min(entry.minConfidence, conf);
-        }
+          return worker;
+        };
+        const meta = await processPage(page, p, pdf.numPages, entry, base, ensureWorker, false);
+        entry.pages.push(meta.text);
+        entry.pageMeta.push(meta);
+        if (meta.source === "ocr") { entry.usedOcr = true; entry.minConfidence = Math.min(entry.minConfidence, meta.confidence); }
       }
 
       entry.fullText = entry.pages.join("\n");
@@ -155,13 +134,18 @@ async function runAnalysis() {
     }
 
     if (worker) await worker.terminate();
-    setProgress(0.97, "Consolidando dados…");
+    state.ocrWorker = null;
+    setProgress(0.97, "Separando relatórios e consolidando dados…");
 
-    state.data = consolidate(state.files);
+    // (#1) Segmenta cada PDF em relatórios individuais.
+    state.reports = segmentReports(state.files);
+
+    state.data = consolidate(state.files, state.reports);
     runValidations(state.data);           // (#3) validações
     computeFieldConfidence(state.data);    // (#2) confiança por campo
     buildSourceMap(state.data);            // mapeia cada campo -> origem no documento
     fillReviewForm(state.data);
+    renderReportsSummary(state.reports);   // (#1) resumo dos relatórios detectados
     renderRawOcr(state.files);
     renderVerifier();                      // visão lado a lado (campos x documento)
     saveSession();                         // (#6) persiste automaticamente
@@ -185,25 +169,74 @@ function setProgress(ratio, text) {
   if (text) progressText.textContent = text;
 }
 
-/** (#9) Extrai a camada de texto digital de uma página + caixas (em pixels da imagem). */
+/**
+ * Processa uma página: decide digital x OCR (por cobertura de texto), rasteriza
+ * imagem leve p/ exibição e extrai identificadores (p/ segmentação em relatórios).
+ * forceOcr=true ignora a heurística e sempre faz OCR (#5 botão "Forçar OCR").
+ */
+async function processPage(page, pageNo, totalPages, entry, base, ensureWorker, forceOcr) {
+  // Imagem leve (JPEG) para a UI/verificador — mantém tudo responsivo (#B).
+  const display = await renderDisplay(page);
+
+  // Avalia a camada de texto digital e sua COBERTURA na página (#5).
+  const digital = await extractDigitalText(page, display.scale);
+  const useDigital = !forceOcr && digital.coverage.ok;
+
+  if (useDigital) {
+    return {
+      source: "digital", confidence: 100,
+      image: display.image, width: display.width, height: display.height,
+      words: digital.words, text: digital.text,
+      coverage: digital.coverage, canForceOcr: true,
+      ...pageIdentifiers(digital.text),
+    };
+  }
+
+  // OCR em alta qualidade (PNG ~300dpi) (#6).
+  const w = await ensureWorker();
+  setProgress(base, `OCR "${entry.name}" — página ${pageNo}/${totalPages}…`);
+  const ocrImg = await renderForOcr(page);
+  const { data } = await w.recognize(ocrImg.image, {}, { blocks: true, text: true });
+  const conf = typeof data.confidence === "number" ? data.confidence : 60;
+  // Converte caixas da escala de OCR para a escala de exibição.
+  const k = display.scale / ocrImg.scale;
+  const words = collectWords(data).map((wd) => {
+    const b = wd.bbox || wd;
+    return { text: wd.text || "", x: b.x0 * k, y: b.y0 * k, w: (b.x1 - b.x0) * k, h: (b.y1 - b.y0) * k };
+  }).filter((wd) => wd.text && isFinite(wd.x) && isFinite(wd.y) && wd.w > 0 && wd.h > 0);
+  const text = data.text || "";
+  return {
+    source: "ocr", confidence: conf,
+    image: display.image, width: display.width, height: display.height,
+    words, text, coverage: digital.coverage, canForceOcr: false,
+    ...pageIdentifiers(text),
+  };
+}
+
+/** (#9) Extrai texto digital + caixas + COBERTURA (área e dispersão vertical). */
 async function extractDigitalText(page, scale) {
   try {
     const content = await page.getTextContent();
-    if (!content.items || !content.items.length) return { text: "", words: [] };
     const vp = page.getViewport({ scale });
+    const pageArea = vp.width * vp.height || 1;
+    if (!content.items || !content.items.length) {
+      return { text: "", words: [], coverage: { ok: false, ratio: 0, spread: 0, chars: 0 } };
+    }
     const words = [];
     const lines = new Map();
+    let textArea = 0, minY = Infinity, maxY = -Infinity, chars = 0;
     for (const item of content.items) {
       const tx = item.transform[4], ty = item.transform[5];
       const y = Math.round(ty);
       if (!lines.has(y)) lines.set(y, []);
       lines.get(y).push({ x: tx, s: item.str });
-      // Converte a posição PDF (origem inferior-esquerda) para pixels da imagem.
       if (item.str && item.str.trim()) {
         const [px, py] = vp.convertToViewportPoint(tx, ty);
-        const w = (item.width || item.str.length * 4) * scale;
-        const h = (item.height || 8) * scale;
-        words.push({ text: item.str.trim(), x: px, y: py - h, w, h });
+        const ww = (item.width || item.str.length * 4) * scale;
+        const hh = (item.height || 8) * scale;
+        words.push({ text: item.str.trim(), x: px, y: py - hh, w: ww, h: hh });
+        textArea += ww * hh; chars += item.str.trim().length;
+        minY = Math.min(minY, py); maxY = Math.max(maxY, py);
       }
     }
     const text = [...lines.entries()]
@@ -211,9 +244,16 @@ async function extractDigitalText(page, scale) {
       .map(([, arr]) => arr.sort((a, b) => a.x - b.x).map((o) => o.s).join(" "))
       .join("\n")
       .replace(/[ \t]{2,}/g, " ");
-    return { text, words };
+
+    // (#5) Cobertura: fração da área coberta por texto E dispersão vertical na página.
+    const ratio = textArea / pageArea;
+    const spread = isFinite(minY) ? (maxY - minY) / vp.height : 0;
+    // Aceita texto digital somente se houver cobertura razoável E o texto não estiver
+    // concentrado só no topo (cabeçalho). Caso contrário, faz OCR.
+    const ok = chars > 120 && ratio > 0.012 && spread > 0.35;
+    return { text, words, coverage: { ok, ratio: +ratio.toFixed(4), spread: +spread.toFixed(2), chars } };
   } catch (_) {
-    return { text: "", words: [] };
+    return { text: "", words: [], coverage: { ok: false, ratio: 0, spread: 0, chars: 0 } };
   }
 }
 
@@ -232,21 +272,177 @@ function collectWords(data) {
   return out;
 }
 
-/** (#8) Rasteriza a página em imagem (limitando a largura) e devolve dimensões e escala. */
-async function pageToImage(page) {
-  let scale = 2.0;
+/** Imagem leve (JPEG) para exibição no verificador — mantém a UI responsiva (#B). */
+async function renderDisplay(page) {
+  let scale = 1.5;
   let viewport = page.getViewport({ scale });
-  const MAX_W = 2000; // (#8) downscale de scans gigantes
-  if (viewport.width > MAX_W) {
-    scale = (2.0 * MAX_W) / viewport.width;
-    viewport = page.getViewport({ scale });
-  }
+  const MAX_W = 1400;
+  if (viewport.width > MAX_W) { scale = (1.5 * MAX_W) / viewport.width; viewport = page.getViewport({ scale }); }
   const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
+  canvas.width = viewport.width; canvas.height = viewport.height;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   await page.render({ canvasContext: ctx, viewport }).promise;
-  return { image: canvas.toDataURL("image/jpeg", 0.8), width: viewport.width, height: viewport.height, scale };
+  return { image: canvas.toDataURL("image/jpeg", 0.82), width: viewport.width, height: viewport.height, scale };
+}
+
+/** (#6) Imagem de alta qualidade (PNG, ~300 dpi) só para o OCR — melhor precisão. */
+async function renderForOcr(page) {
+  // PDFs usam 72 dpi como base; escala p/ ~300 dpi ≈ 4.17.
+  let scale = 300 / 72;
+  let viewport = page.getViewport({ scale });
+  const MAX_W = 3200; // teto p/ não estourar memória em scans enormes
+  if (viewport.width > MAX_W) { scale = scale * (MAX_W / viewport.width); viewport = page.getViewport({ scale }); }
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width; canvas.height = viewport.height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return { image: canvas.toDataURL("image/png"), width: viewport.width, height: viewport.height, scale };
+}
+
+/* ---------------------------------------------------------------------------
+ * (#4) Reconhecimento de nomes/abreviações de exame — usado na classificação
+ *      e na extração (regras consistentes).
+ * ------------------------------------------------------------------------- */
+// Retorna {tipo, titulo} ou null. Aceita TC, RM, RNM, US/USG com variações.
+function recognizeExam(rawText) {
+  const t = norm(rawText);
+  // Título do exame: prioriza a linha de título do laudo (tomografia/ressonância/US),
+  // depois o campo "Exame:" (com fronteira de palavra p/ não casar "Data Exame").
+  let titleLine =
+    grab(rawText, /\n\s*(tomografia\s+computadorizada[^\n]*|resson[aâ]ncia\s+magn[eé]tica[^\n]*|ultrassonografia[^\n]*|ultrassom[^\n]*)/i) ||
+    grab(rawText, /(?:^|\n)\s*exame\s*:\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .\/()\-]{3,}?)(?:\n|n[uú]mero|c[oó]digo|sexo|data)/i) || "";
+  // Nunca aceita uma data como título.
+  if (/^\s*\d{2}\/\d{2}\/\d{2,4}\s*$/.test(titleLine)) titleLine = "";
+  const titulo = (titleLine || "").replace(/\s+/g, " ").trim();
+  const hay = norm(titulo) + " " + t;
+
+  // Tomografia computadorizada (TC)
+  if (/\btomografia\b|\btc\b(?![a-z])|tomografia computadorizada/.test(hay)) {
+    const torax = /t[oó]rax/.test(hay);
+    return { tipo: "TC (tomografia)", titulo: titulo || (torax ? "Tomografia computadorizada do tórax" : "Tomografia computadorizada"), torax };
+  }
+  // Ressonância magnética (RM / RNM / RM abdome / RM pelve)
+  if (/\bresson[aâ]ncia\b|resson[aâ]ncia magnetica|\brm\b|\brnm\b|\brm\s*abdome|\brm\s*pelve/.test(hay)) {
+    return { tipo: "RM/RNM (ressonância)", titulo: titulo || "Ressonância magnética" };
+  }
+  // Ultrassonografia (US / USG) — mas NÃO procedimento "orientado por ultrassonografia".
+  if ((/\bultrassonografia\b|\bultrassom\b|\bus\b|\busg\b|ecografia/.test(hay)) && !/orientad[ao] por ultrassonografia|biopsia/.test(hay)) {
+    return { tipo: "USG (ultrassom)", titulo: titulo || "Ultrassonografia" };
+  }
+  return null;
+}
+
+/* ---------------------------------------------------------------------------
+ * (#1) Identificadores por página + segmentação em relatórios
+ * ------------------------------------------------------------------------- */
+// Extrai identificadores de EXAME (não do paciente) e um "header" do laudo.
+function pageIdentifiers(text) {
+  const t = text || "";
+  // Número do pedido = identificador do EXAME.
+  const orderNo =
+    grab(t, /n[uú]mero\s*(?:do\s*)?pedido\s*:?\s*(\d{4,})/i) ||
+    grab(t, /n[uú]mero\s*do\s*pedido\s*:?\s*(\d{4,})/i) || "";
+  // "Código Externo": usar APENAS quando identifica o exame (rótulo do pedido),
+  // e NÃO quando é código do paciente.
+  let externo = grab(t, /c[oó]digo\s*externo\s*:?\s*(\d{4,})/i) || "";
+  // Se houver "Código do Paciente" com o mesmo número, não é identificador de exame.
+  const patientCode = grab(t, /c[oó]digo\s*(?:do\s*)?paciente\s*:?\s*(\d{3,})/i) || "";
+  if (externo && externo === patientCode) externo = "";
+
+  const exam = recognizeExam(t);
+  const examTitle = exam ? exam.titulo : "";
+  const examDate =
+    grab(t, /data\s*(?:do\s*)?exame\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) ||
+    grab(t, /data\s*(?:do\s*)?pedido\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) || "";
+  // "Header" institucional (primeiras linhas significativas) — não define sozinho um relatório.
+  const header = norm((t.split("\n").find((l) => /hospital|laborat[oó]rio|associa[cç][aã]o|departamento|unifesp|secretaria/i.test(l)) || "").slice(0, 60));
+
+  const hasExamIds = !!(orderNo || externo || examTitle || examDate);
+  return {
+    ids: { orderNo, externo, examTitle: norm(examTitle), examDate, header, examType: exam ? exam.tipo : "" },
+    hasExamIds,
+  };
+}
+
+/**
+ * Agrupa as páginas de todos os PDFs em relatórios individuais.
+ * Regras: número do pedido novo => novo relatório; sem pedido, usa (header+título+data);
+ * cabeçalho repetido sozinho NÃO inicia relatório; páginas sem ids de exame são
+ * continuação do relatório anterior; fronteiras ambíguas ficam marcadas p/ revisão.
+ */
+function segmentReports(files) {
+  const reports = [];
+  let current = null;
+
+  const sameOrder = (a, b) => a.orderNo && b.orderNo && a.orderNo === b.orderNo;
+  const sameExamTriplet = (a, b) =>
+    a.examTitle && b.examTitle && a.examTitle === b.examTitle &&
+    (!a.examDate || !b.examDate || a.examDate === b.examDate);
+
+  for (let fi = 0; fi < files.length; fi++) {
+    const f = files[fi];
+    (f.pageMeta || []).forEach((meta, pi) => {
+      const ids = meta.ids || {};
+      const ref = { fileIndex: fi, pageIndex: pi, fileName: f.name };
+
+      if (!current) { current = startReport(ids, ref, meta); reports.push(current); return; }
+
+      // Página sem identificadores de exame -> continuação do relatório atual.
+      if (!meta.hasExamIds) { attachPage(current, ref, meta); return; }
+
+      // Mesmo número de pedido -> mesma (continuação do) relatório.
+      if (current.ids.orderNo && ids.orderNo && sameOrder(current.ids, ids)) { attachPage(current, ref, meta); return; }
+
+      // Página com pedido que casa com um relatório anterior (ex.: assinatura) -> anexa lá.
+      if (ids.orderNo) {
+        const match = reports.find((r) => r.ids.orderNo === ids.orderNo);
+        if (match) { attachPage(match, ref, meta); return; }
+        // Pedido novo -> novo relatório.
+        current = startReport(ids, ref, meta); reports.push(current); return;
+      }
+
+      // Sem número de pedido: decide por (título + data) de exame.
+      if (sameExamTriplet(current.ids, ids)) { attachPage(current, ref, meta); return; }
+
+      // Título/data de exame diferentes -> novo relatório.
+      if (ids.examTitle || ids.examDate) { current = startReport(ids, ref, meta); reports.push(current); return; }
+
+      // Caso indefinido -> anexa ao atual e marca ambíguo.
+      attachPage(current, ref, meta); current.ambiguous = true;
+    });
+  }
+
+  // Pós-processo: título/tipo final e texto consolidado por relatório.
+  reports.forEach((r, i) => {
+    r.index = i;
+    r.text = r.pages.map((p) => p.meta.text).join("\n");
+    if (!r.ids.examType) {
+      const ex = recognizeExam(r.text);
+      if (ex) { r.ids.examType = ex.tipo; if (!r.ids.examTitle) r.ids.examTitle = norm(ex.titulo); }
+    }
+    r.label = reportLabel(r);
+  });
+  return reports;
+}
+
+function startReport(ids, ref, meta) {
+  return { ids: { ...ids }, pages: [{ ...ref, meta }], ambiguous: false };
+}
+function attachPage(report, ref, meta) {
+  report.pages.push({ ...ref, meta });
+  // Completa identificadores ausentes a partir da continuação (ex.: data só no corpo).
+  const ids = meta.ids || {};
+  for (const k of ["orderNo", "externo", "examTitle", "examDate", "examType"]) {
+    if (!report.ids[k] && ids[k]) report.ids[k] = ids[k];
+  }
+}
+function reportLabel(r) {
+  const title = r.ids.examTitle ? titleCase(r.ids.examTitle) : (r.ids.examType || "Documento");
+  const date = r.ids.examDate ? ` — ${r.ids.examDate}` : "";
+  const ord = r.ids.orderNo ? ` · pedido ${r.ids.orderNo}` : "";
+  const pgs = r.pages.map((p) => `${p.fileName}:${p.pageIndex + 1}`).join(", ");
+  return { title: title + date + ord, pages: pgs };
 }
 
 /* ---------------------------------------------------------------------------
@@ -274,7 +470,7 @@ function detectDocType(text) {
 /* ---------------------------------------------------------------------------
  * 4) Extração de campos por tipo + consolidação
  * ------------------------------------------------------------------------- */
-function consolidate(files) {
+function consolidate(files, reports) {
   const d = {
     paciente: "", dataNasc: "", idade: "", cpf: "", rgct: "",
     equipe: "", hospital: "",
@@ -288,7 +484,7 @@ function consolidate(files) {
   };
 
   for (const f of files) {
-    const t = f.fullText;
+    const t = f.fullText || (f.pages ? f.pages.join("\n") : "");
     const n = norm(t);
 
     // Nome do paciente
@@ -320,9 +516,7 @@ function consolidate(files) {
     // Carta final: "Alfa-fetoproteína: 24/05/2024: 13,8 ng/mL; ..."
     extractAfpInline(t).forEach((a) => pushAfp(d, a));
 
-    // Exames de imagem (TC / RM-RNM / USG) — extração dedicada
-    const exam = extractImaging(t, f.detected);
-    if (exam) d.imaging.push(exam);
+    // (Exames de imagem são extraídos POR RELATÓRIO, após este laço — ver abaixo.)
 
     // Carta: "TC tórax (09/06/2025): sem metástase pulmonar."
     const tcLinha = t.match(/tc\s*t[oó]rax\s*\((\d{2}\/\d{2}\/\d{4})\)\s*:?\s*([^\n.]+)/i);
@@ -356,6 +550,20 @@ function consolidate(files) {
     takeFirst(d, "crm", grab(t, /crm\s*:?\s*([\d.]+)/i));
   }
 
+  // (#1) Exames de imagem extraídos POR RELATÓRIO — a data de um exame nunca
+  // se mistura com os achados de outro.
+  if (reports && reports.length) {
+    for (const r of reports) {
+      const exam = extractImaging(r.text, r.ids.examType, r.ids);
+      if (exam) {
+        exam.reportIndex = r.index;
+        exam.pages = r.pages.map((p) => `${p.fileName}:${p.pageIndex + 1}`).join(", ");
+        exam.ambiguous = !!r.ambiguous;
+        d.imaging.push(exam);
+      }
+    }
+  }
+
   // Normalizações / defaults
   d.equipe = cleanTrailing(d.equipe);
   d.criterioBarcelona = d.criterioBarcelona || "critério radiológico (1 exame de imagem trifásico)";
@@ -384,12 +592,18 @@ function consolidate(files) {
   const latestRm = rmExams.length ? rmExams[rmExams.length - 1] : null;
   if (latestRm) takeFirst(d, "imagemData", latestRm.data);
 
-  // Montar o texto de achados da RNM para a carta (usa achados estruturados)
+  // Montar o texto de achados da RNM para a carta — preserva achados COMPLETOS (#2).
   if (!d.rnmAchados) {
     const lines = [];
     rmExams.forEach((e) => {
       const head = `${e.nome || "RNM Abdome"}${e.data ? " (" + e.data + ")" : ""}:`;
-      const body = (e.achados && e.achados.length) ? e.achados.join(" ") : (e.impressao || "");
+      // Prioriza bullets de segmento/LI-RADS; adiciona o restante da análise completa
+      // e a conclusão/impressão — sem truncar.
+      const parts = [];
+      if (e.achados && e.achados.length) parts.push(e.achados.join(" "));
+      if (e.analiseCompleta && !(e.achados && e.achados.length)) parts.push(e.analiseCompleta);
+      if (e.impressao) parts.push("Conclusão: " + e.impressao);
+      const body = parts.join(" ").trim();
       if (body) lines.push(`${head} ${body}`);
     });
     d.rnmAchados = lines.join("\n");
@@ -399,69 +613,91 @@ function consolidate(files) {
 }
 
 /* --- Extração de um laudo de imagem (TC / RM-RNM / USG) --- */
-function extractImaging(t, detected) {
-  const n = norm(t);
-  const isImaging = /tomografia|ressonancia magnetica|\brm\b|rnm|ultrassonografia|ultrassom|\busg\b/.test(n)
-    && !/quimioembolizacao transarterial|radiologia intervencionista|biopsia de linfonodo/.test(n);
-  if (!isImaging) return null;
+function extractImaging(t, examType, ids) {
+  // (#4) Reconhecimento consistente do exame (TC/RM/RNM/US-USG).
+  const exam = recognizeExam(t);
+  // (#3) NÃO descartar laudo de imagem por mencionar quimioembolização prévia.
+  // Só excluímos quando o DOCUMENTO É o procedimento em si (não um laudo de imagem).
+  const isProcedure = /quimioembolizacao transarterial|radiologia intervencionista|biopsia de linfonodo orientada/i.test(norm(t));
+  if (!exam && isProcedure) return null;         // é o laudo do procedimento, não imagem
+  if (!exam) return null;                          // sem título de exame reconhecível
 
-  // Nome do exame: campo "Exame:" ou o título do laudo
-  let nome = grab(t, /exame\s*:?\s*([A-Za-zÀ-ÿ .\/]+?)(?:\n|n[uú]mero|data|c[oó]digo)/i);
-  if (!nome) {
-    nome = grab(t, /\n\s*(tomografia computadorizada[^\n]*|ressonancia magnetica[^\n]*|ultrassonografia[^\n]*)/i);
-  }
-  nome = (nome || "").replace(/\s+/g, " ").trim();
+  const tipo = exam.tipo;
+  // Nome: campo "Exame:" ou o título reconhecido.
+  let nome = ids && ids.examTitle ? ids.examTitle : "";
+  if (!nome) nome = grab(t, /exame\s*:?\s*([A-Za-zÀ-ÿ0-9 .\/()\-]+?)(?:\n|n[uú]mero|data|c[oó]digo|sexo)/i);
+  if (!nome) nome = exam.titulo;
+  nome = titleOrRaw((nome || "").replace(/\s+/g, " ").trim());
 
-  // Tipo
-  let tipo = "Imagem";
-  if (/tomografia|tc\b/i.test(nome) || /tomografia computadorizada/i.test(n)) tipo = "TC (tomografia)";
-  if (/ressonancia|\brm\b|rnm/i.test(nome) || /ressonancia magnetica/i.test(n)) tipo = "RM/RNM (ressonância)";
-  if (/ultrass|usg|ecografia/i.test(nome)) tipo = "USG (ultrassom)";
-
-  // Data do exame: tenta vários rótulos (Data Exame / Data do Exame / Data do Pedido / Coleta)
-  const data =
+  // Data do exame (vários rótulos).
+  const data = (ids && ids.examDate) ||
     grab(t, /data\s*(?:do\s*)?exame\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) ||
     grab(t, /data\s*(?:do\s*)?pedido\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) ||
     grab(t, /data\s*(?:de\s*)?coleta\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) ||
     grab(t, /coleta\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) || "";
 
-  // Impressão / Opinião / Impressão diagnóstica
+  // (#2) Conclusão / impressão — bloco COMPLETO (multi-linha).
   const impressao =
     grabBlock(t, /impress[aã]o\s*diagn[oó]stica\s*:?/i) ||
     grabBlock(t, /\bopini[aã]o\s*:?/i) ||
     grabBlock(t, /conclus[aã]o\s*:?/i) || "";
 
-  // Achados estruturados (segmentos / LI-RADS) — captura linhas com "Segmento ... LI-RADS"
-  const achados = [];
-  [...t.matchAll(/segmento\s+[^\n]*?(?:li-?rads|lr\s*tr)[^\n]*/gi)]
-    .forEach((m) => achados.push(m[0].replace(/\s+/g, " ").trim()));
-  // Se não há segmentos, usa o bloco ANÁLISE como achado principal
-  if (!achados.length) {
-    const analise = grabBlock(t, /an[aá]lise\s*:?/i) || grabBlock(t, /descri[cç][aã]o\s*:?/i);
-    if (analise) achados.push(firstSentences(analise, 2));
-  }
+  // (#2) Achados COMPLETOS: todo o bloco ANÁLISE/DESCRIÇÃO (multi-linha), mais os
+  // itens de segmento/LI-RADS destacados como bullets — sem truncar em 2 frases.
+  const analiseBloco =
+    grabBlock(t, /an[aá]lise\s*:?/i) ||
+    grabBlock(t, /descri[cç][aã]o\s*:?/i) ||
+    grabBlock(t, /achados\s*:?/i) || "";
 
-  return { tipo, nome: nome || tipo, data, impressao: impressao.replace(/\s+/g, " ").trim(), achados };
+  const achados = [];
+  // Segmentos/LI-RADS podem ocupar mais de uma linha: captura "Segmento ... (LI-RADS n)."
+  const segRe = /segmento\s+[\s\S]*?(?:li-?rads|lr\s*tr|lirads)[^.\n]*\.?/gi;
+  const segMatches = (analiseBloco + "\n" + t).match(segRe) || [];
+  const segSeen = new Set();
+  segMatches.forEach((s) => {
+    const clean = s.replace(/\s+/g, " ").trim();
+    const key = clean.toLowerCase();
+    if (!segSeen.has(key)) { segSeen.add(key); achados.push(clean); }
+  });
+
+  // Além dos segmentos, preserva o texto integral da análise (sem truncar),
+  // removendo ruído de assinatura/rodapé que possa vir de página de continuação.
+  const analiseFull = stripSignatureNoise(analiseBloco).replace(/\s+/g, " ").trim();
+
+  return {
+    tipo, nome: nome || tipo, data,
+    impressao: impressao.replace(/\s+/g, " ").trim(),
+    achados,                       // bullets de segmento/LI-RADS (se houver)
+    analiseCompleta: analiseFull,  // (#2) bloco completo preservado
+  };
 }
 
-/** Captura o bloco de texto após um rótulo até o próximo rótulo em MAIÚSCULAS ou dupla quebra. */
+/** Captura o bloco após um rótulo até o próximo rótulo de seção conhecido ou título MAIÚSCULO. */
 function grabBlock(t, labelRe) {
   const m = t.match(labelRe);
   if (!m) return "";
   const start = m.index + m[0].length;
   const rest = t.slice(start);
-  // para no próximo rótulo: título em MAIÚSCULAS com ":" OU rótulos conhecidos de seção
-  const stopUpper = rest.search(/\n\s*[A-ZÀ-Ý][A-ZÀ-Ý \-]{3,}\s*:/);
-  const stopLabel = rest.search(/\n?\s*(impress[aã]o\s*diagn[oó]stica|an[aá]lise|opini[aã]o|conclus[aã]o|t[eé]cnica|metodologia)\s*:/i);
+  const stopUpper = rest.search(/\n\s*[A-ZÀ-Ý][A-ZÀ-Ý \-]{4,}\s*:?\s*\n/);
+  const stopLabel = rest.search(/\n?\s*(impress[aã]o\s*diagn[oó]stica|an[aá]lise|opini[aã]o|conclus[aã]o|t[eé]cnica|metodologia|respons[aá]veis|assinad|liberado|data da impress)\s*:?/i);
   const stops = [stopUpper, stopLabel].filter((x) => x > -1);
   const stop = stops.length ? Math.min(...stops) : -1;
-  const block = stop > -1 ? rest.slice(0, stop) : rest;
+  const block = stop > 0 ? rest.slice(0, stop) : rest;
   return block.replace(/\s+/g, " ").trim();
 }
 
-function firstSentences(s, n) {
-  const parts = s.split(/(?<=[.;])\s+/).slice(0, n);
-  return parts.join(" ").trim();
+/** Remove ruído de assinatura/rodapé/ID que vem de páginas de continuação. */
+function stripSignatureNoise(s) {
+  if (!s) return s;
+  const cut = s.search(/\b(patient id|acc#|report date|liberado eletronicamente|assinado por|dra?\.?\s+[a-zç]+\s+[a-zç]+\s+crm|crm\/?sp?\s*\d|responsa[vb]el|data da impress|impresso em)\b/i);
+  return cut > 0 ? s.slice(0, cut).trim() : s;
+}
+
+/** Mantém títulos reconhecíveis legíveis sem destruir siglas. */
+function titleOrRaw(s) {
+  if (!s) return s;
+  // Se estiver todo em maiúsculas, aplica Title Case; senão mantém.
+  return s === s.toUpperCase() ? titleCase(s) : s;
 }
 
 function dedupeImaging(arr) {
@@ -867,6 +1103,22 @@ function renderConfidenceBanner(d) {
   box.innerHTML = html;
 }
 
+/** (#1) Resumo dos relatórios individuais detectados dentro dos PDFs. */
+function renderReportsSummary(reports) {
+  const box = $("#reportsSummary");
+  if (!box) return;
+  if (!reports || !reports.length) { box.innerHTML = ""; return; }
+  box.innerHTML = `<h4>Relatórios identificados (${reports.length})</h4>` +
+    reports.map((r) => {
+      const lbl = r.label || reportLabel(r);
+      const amb = r.ambiguous ? `<span class="rep-amb" title="Fronteira ambígua — revise manualmente">⚠ revisar</span>` : "";
+      return `<div class="rep-card ${r.ambiguous ? "amb" : ""}">
+        <div class="rep-head"><strong>${escapeHtml(lbl.title)}</strong> ${amb}</div>
+        <div class="rep-pages">Páginas: ${escapeHtml(lbl.pages)}</div>
+      </div>`;
+    }).join("");
+}
+
 /** (#14) Lista os exames de imagem detectados com a fonte. */
 function renderImagingList(d) {
   const box = $("#imagingList");
@@ -912,6 +1164,12 @@ function renderVerifier() {
     `<button class="pg-tab ${pi === verifierState.pageIndex ? "active" : ""}" data-pi="${pi}">Pág. ${pi + 1}</button>`
   ).join("");
 
+  const curMeta = f.pageMeta[verifierState.pageIndex];
+  const forceBtn = curMeta.source === "digital"
+    ? `<button id="verForceOcr" class="btn btn-ghost btn-sm" type="button">🔁 Forçar OCR nesta página</button>`
+    : "";
+  const cov = curMeta.coverage ? ` (cobertura ${Math.round((curMeta.coverage.ratio || 0) * 100)}%)` : "";
+
   host.innerHTML = `
     <div class="verifier-head">
       <h4>Verificação — origem dos dados</h4>
@@ -920,7 +1178,8 @@ function renderVerifier() {
         <label class="ver-toggle"><input type="checkbox" id="verShowAll" ${verifierState.showAll ? "checked" : ""}> Mostrar todos os destaques</label>
       </div>
     </div>
-    <p class="ver-hint">Clique em um campo do formulário para destacar onde ele aparece no documento. ${f.pageMeta[verifierState.pageIndex].source === "ocr" ? "Página lida por OCR." : "Página com texto digital."}</p>
+    <p class="ver-hint">Clique em um campo para destacar sua origem. Fonte desta página:
+      <strong>${curMeta.source === "ocr" ? "OCR (300 dpi)" : "texto digital" + cov}</strong>. ${forceBtn}</p>
     <div class="ver-pagetabs">${pageTabs}</div>
     <div class="ver-stage" id="verStage"></div>
   `;
@@ -937,8 +1196,46 @@ function renderVerifier() {
   host.querySelectorAll(".pg-tab").forEach((b) =>
     b.addEventListener("click", () => { verifierState.pageIndex = Number(b.dataset.pi); renderVerifier(); })
   );
+  const fb = $("#verForceOcr");
+  if (fb) fb.addEventListener("click", () => forceOcrPage(verifierState.fileIndex, verifierState.pageIndex));
 
   drawStage();
+}
+
+/** (#5) Reprocessa uma página específica forçando OCR, depois re-consolida tudo. */
+async function forceOcrPage(fileIndex, pageIndex) {
+  const f = state.files[fileIndex];
+  if (!f) return;
+  const fb = $("#verForceOcr");
+  if (fb) { fb.disabled = true; fb.textContent = "Executando OCR…"; }
+  try {
+    const pdf = await pdfjsLib.getDocument({ data: await f.file.arrayBuffer() }).promise;
+    const page = await pdf.getPage(pageIndex + 1);
+    let worker = state.ocrWorker;
+    const ensureWorker = async () => {
+      if (!worker) { worker = await Tesseract.createWorker("por", 1); state.ocrWorker = worker; }
+      return worker;
+    };
+    const meta = await processPage(page, pageIndex + 1, pdf.numPages, f, 0, ensureWorker, true);
+    f.pageMeta[pageIndex] = meta;
+    f.pages[pageIndex] = meta.text;
+    f.fullText = f.pages.join("\n");
+    f.usedOcr = true;
+    // Re-segmenta e re-consolida com o novo conteúdo da página.
+    state.reports = segmentReports(state.files);
+    state.data = consolidate(state.files, state.reports);
+    runValidations(state.data);
+    computeFieldConfidence(state.data);
+    buildSourceMap(state.data);
+    fillReviewForm(state.data);
+    renderReportsSummary(state.reports);
+    renderImagingList(state.data);
+    saveSession();
+    renderVerifier();
+  } catch (e) {
+    console.error(e); alert("Falha ao forçar OCR: " + e.message);
+    if (fb) { fb.disabled = false; fb.textContent = "🔁 Forçar OCR nesta página"; }
+  }
 }
 
 function drawStage(focusField) {
