@@ -446,8 +446,11 @@ input.flash, textarea.flash { animation: fieldflash 0.9s ease; }
         <fieldset>
           <legend>Escore MELD / MELD-Na</legend>
           <div class="grid">
+            <label>Valor MELD <input name="meld" type="text" /></label>
             <label>Valor MELD-Na <input name="meldNa" type="text" /></label>
             <label>Data do exame MELD <input name="meldData" type="text" placeholder="dd/mm/aaaa" /></label>
+            <label>Data de validade do exame <input name="meldValidade" type="text" placeholder="dd/mm/aaaa" /></label>
+            <label>Data da tela (não é a do exame) <input name="meldScreenDate" type="text" placeholder="dd/mm/aaaa" /></label>
             <label>Creatinina (mg/dL) <input name="creatinina" type="text" /></label>
             <label>Bilirrubina total (mg/dL) <input name="bilirrubina" type="text" /></label>
             <label>INR <input name="inr" type="text" /></label>
@@ -1034,13 +1037,17 @@ function consolidate(files, reports) {
   const d = {
     paciente: "", dataNasc: "", idade: "", cpf: "", rgct: "",
     equipe: "", hospital: "",
-    meldNa: "", meldData: "", creatinina: "", bilirrubina: "", inr: "", sodio: "",
+    meld: "", meldNa: "", meldData: "", meldScreenDate: "", meldValidade: "",
+    creatinina: "", bilirrubina: "", inr: "", sodio: "",
+    meldHistory: [],   // [{date, creat, bili, inr, meld, meldNa, validade}]
+    meldCandidates: [], // (date, value) de MELD-Na considerados na seleção
     afp: [], // {data, valor}
     imaging: [], // {tipo, nome, data, impressao, achados:[...]}
     imagemData: "", tcToraxData: "", afpExameData: "", tcToraxResultado: "",
     taceDatas: "", irressecabilidade: "", criterioBarcelona: "",
     rnmAchados: "", indicacao: "",
     medico: "", crm: "", dataRelatorio: "",
+    fieldSources: {}, // { campo: {fileIndex, pageIndex, bbox, confidence} }
   };
 
   for (const f of files) {
@@ -1061,13 +1068,20 @@ function consolidate(files, reports) {
     takeFirst(d, "equipe", grab(t, /equipe\s*:?\s*([A-Za-zÀ-ÿ ]+)/i));
     takeFirst(d, "hospital", grab(t, /hospital\s*:?\s*(s[aã]o\s*paulo[^\n]*)/i) || (/\bhospital s[aã]o paulo\b/i.test(t) ? "HOSPITAL SÃO PAULO" : ""));
 
-    // MELD
-    takeFirst(d, "meldNa", grab(t, /meld[-\s]?na[^0-9]*?(\d{1,2})/i) || grab(t, /valor\s*meld\/?na\s*:?\s*(\d{1,2})/i));
-    takeFirst(d, "meldData", grab(t, /data\s*do\s*exame\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i));
-    takeFirst(d, "creatinina", grab(t, /creatinina[^0-9]*?(\d[.,]\d{1,2})/i));
-    takeFirst(d, "bilirrubina", grab(t, /bilirrubina[^0-9]*?(\d[.,]\d{1,2})/i));
-    takeFirst(d, "inr", grab(t, /\binr\b[^0-9]*?(\d[.,]\d{1,2})/i));
-    takeFirst(d, "sodio", grab(t, /s[oó]dio[^0-9]*?(\d{2,3}[.,]?\d{0,2})/i));
+    // MELD — a extração robusta (tela MELD) acontece abaixo, por página, com caixas.
+    // Aqui tratamos apenas o LAUDO LABORATORIAL (texto corrido), de forma restrita.
+    const isMeldScreen = /tela meld|valor do meld|data de validade do exame|comprov\. de inscri/.test(n);
+    if (!isMeldScreen) {
+      // Laudo laboratorial: valores rotulados, "sem diálise" por padrão (Q2=b).
+      const labMeldNa = grab(t, /meld[-\s]?na\s*\(?\s*sem\s*di[aá]lise\)?[^0-9]*?(\d{1,2})\b/i)
+        || grab(t, /meld[-\s]?na[^0-9]*?(\d{1,2})\b/i);
+      if (labMeldNa) collectMeldCandidate(d, labMeldNa,
+        grab(t, /coleta\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i) || grab(t, /data\s*(?:de\s*)?entrada\s*:?\s*(\d{2}\/\d{2}\/\d{4})/i), f, null);
+      takeFirst(d, "creatinina", grab(t, /creatinina[^0-9]*?(\d[.,]\d{1,2})/i));
+      takeFirst(d, "bilirrubina", grab(t, /bilirrubina[^0-9]*?(\d[.,]\d{1,2})/i));
+      takeFirst(d, "inr", grab(t, /\binr\b[^0-9]*?(\d[.,]\d{1,2})/i));
+      takeFirst(d, "sodio", grab(t, /s[oó]dio[^0-9]*?(\d{2,3}[.,]?\d{0,2})/i));
+    }
 
     // Alfa-fetoproteína: valores com data no próprio laudo ou "Resultados Anteriores"
     if (/alfa\s*fetoprote/i.test(n) || /fetoprote/i.test(n)) {
@@ -1123,6 +1137,18 @@ function consolidate(files, reports) {
       }
     }
   }
+
+  // (#3) Extração dedicada da TELA MELD por página (usando caixas de palavras).
+  for (let fi = 0; fi < files.length; fi++) {
+    const f = files[fi];
+    (f.pageMeta || []).forEach((meta, pi) => {
+      if (!/tela meld|valor do meld|data de validade do exame|comprov\. de inscri/.test(norm(meta.text || ""))) return;
+      extractMeldScreen(d, meta, fi, pi);
+    });
+  }
+
+  // Regra de seleção do MELD-Na (Q1=a janela vs. hoje; Q2=b sem diálise; Q3=a fallback).
+  selectMeldNa(d);
 
   // Normalizações / defaults
   d.equipe = cleanTrailing(d.equipe);
@@ -1274,6 +1300,236 @@ function dedupeImaging(arr) {
   return [...seen.values()];
 }
 
+/* ===========================================================================
+ * TELA MELD — extração por regiões e caixas de palavras (label -> valor ao lado)
+ * Requisitos: associar cada rótulo ao valor imediatamente à direita na MESMA
+ * linha e região; MELD e MELD-Na separados; datas (exame/tela/validade/histórico)
+ * em campos distintos; valores ilegíveis ficam vazios e sinalizados; nunca
+ * substituir por vizinho ou por cálculo. Registra fonte (arquivo/página/bbox/conf).
+ * ======================================================================== */
+function extractMeldScreen(d, meta, fileIndex, pageIndex) {
+  const words = (meta.words || []).map((w) => ({ ...w, n: normToken(w.text), cx: w.x + w.w / 2, cy: w.y + w.h / 2 }));
+  if (!words.length) return;
+  const conf = meta.confidence != null ? meta.confidence : 100;
+  const src = (bbox) => ({ fileIndex, pageIndex, bbox, confidence: conf });
+
+  // Agrupa palavras em linhas por proximidade vertical.
+  const rows = groupRows(words);
+
+  // Localiza um rótulo (sequência de tokens) e devolve sua caixa + a linha.
+  const findLabel = (labelTokens) => {
+    for (const row of rows) {
+      const idx = findTokenSeq(row, labelTokens);
+      if (idx >= 0) return { row, startIdx: idx, endIdx: idx + labelTokens.length - 1 };
+    }
+    return null;
+  };
+
+  // Valor imediatamente à direita do rótulo, na MESMA linha, dentro de um limite horizontal.
+  const valueRightOf = (hit, re, maxGap) => {
+    if (!hit) return null;
+    const after = hit.row.slice(hit.endIdx + 1);
+    for (const w of after) {
+      const v = (w.text || "").match(re);
+      if (v) return { value: v[1] || v[0], bbox: box(w), conf };
+    }
+    // Permite que o valor esteja na metade direita da mesma linha (colunas).
+    return null;
+  };
+
+  // Rótulo -> valor (número/decimal/data). Restrito à linha e região.
+  const label = {
+    dataExame: ["data", "do", "exame"],
+    creatinina: ["creatinina"],
+    bilirrubina: ["bilirrubina"],
+    inr: ["inr"],
+    sodio: ["sodio"],
+    sodioSerico: ["sodio", "serico"],
+    valorMeld: ["valor", "do", "meld"],
+    valorMeldNa: ["valor", "meld/na"],
+    validade: ["data", "de", "validade", "do", "exame"],
+    dataTela: ["data"], // usada só no cabeçalho "Data: dd/mm/aaaa" da tela
+  };
+
+  const DATE = /(\d{2}\/\d{2}\/\d{4})/;
+  const DEC = /^(\d{1,3}[.,]\d{1,2})$/;
+  const INT = /^(\d{1,2})$/;
+  const NUMBROAD = /(\d{1,3}(?:[.,]\d{1,2})?)/;
+
+  // --- Coluna esquerda (exame + laboratoriais) ---
+  setField(d, "meldData", valueRightOf(findLabel(label.dataExame), DATE, 400), src);
+  setField(d, "creatinina", valueRightOf(findLabel(label.creatinina), NUMBROAD, 300), src);
+  setField(d, "bilirrubina", valueRightOf(findLabel(label.bilirrubina), NUMBROAD, 300), src);
+  setField(d, "inr", valueRightOf(findLabel(label.inr), NUMBROAD, 300), src);
+  const sodHit = findLabel(label.sodioSerico) || findLabel(label.sodio);
+  setField(d, "sodio", valueRightOf(sodHit, NUMBROAD, 300), src);
+
+  // --- Coluna direita (MELD, MELD-Na, validade) ---
+  setField(d, "meld", valueRightOf(findLabel(label.valorMeld), NUMBROAD, 300), src);
+  setField(d, "meldValidade", valueRightOf(findLabel(label.validade), DATE, 300), src);
+
+  // MELD-Na da tela — vira CANDIDATO (não grava direto; a seleção decide).
+  const meldNaRes = valueRightOf(findLabel(label.valorMeldNa), NUMBROAD, 300);
+  if (meldNaRes && meldNaRes.value) {
+    collectMeldCandidate(d, meldNaRes.value, d.meldData, { name: meta.fileName }, src(meldNaRes.bbox), "tela");
+  }
+
+  // Data da TELA (cabeçalho "Data: 21/07/2025") — NUNCA vira data do exame.
+  const telaHit = rows.map((r) => r.find((w) => /^data:?$/i.test(w.text))).find(Boolean);
+  if (telaHit) {
+    const row = rows.find((r) => r.includes(telaHit));
+    const after = row.slice(row.indexOf(telaHit) + 1);
+    const dv = after.map((w) => (w.text.match(DATE) || [])[1]).find(Boolean);
+    if (dv && dv !== d.meldData) setField(d, "meldScreenDate", { value: dv, bbox: box(telaHit), conf }, src);
+  }
+
+  // --- Tabela de Histórico ---
+  extractMeldHistory(d, rows, fileIndex, pageIndex, conf);
+}
+
+/** Grava um campo a partir de um resultado {value,bbox,conf}. Vazio => sinaliza revisão. */
+function setField(d, field, result, srcFn) {
+  if (!result || !result.value) {
+    if (!d[field]) markReview(d, field);  // ilegível/ausente -> revisar (nunca substitui)
+    return;
+  }
+  if (!d[field]) {
+    d[field] = result.value;
+    d.fieldSources[field] = srcFn(result.bbox);
+  }
+}
+
+function markReview(d, field) {
+  d.reviewFlags = d.reviewFlags || {};
+  d.reviewFlags[field] = "valor ilegível/não encontrado — revisar manualmente.";
+}
+
+/** Agrupa palavras em linhas (por Y), ordenando cada linha por X. */
+function groupRows(words) {
+  const sorted = [...words].sort((a, b) => a.cy - b.cy);
+  const rows = [];
+  const tol = 10;
+  for (const w of sorted) {
+    let row = rows.find((r) => Math.abs(r.cy - w.cy) <= Math.max(tol, w.h * 0.6));
+    if (!row) { row = Object.assign([], { cy: w.cy }); rows.push(row); }
+    row.push(w);
+    row.cy = (row.cy * (row.length - 1) + w.cy) / row.length;
+  }
+  rows.forEach((r) => r.sort((a, b) => a.x - b.x));
+  return rows.sort((a, b) => a.cy - b.cy);
+}
+
+/** Procura a sequência de tokens (normalizados) numa linha; devolve o índice inicial. */
+function findTokenSeq(row, tokens) {
+  for (let i = 0; i + tokens.length <= row.length; i++) {
+    let ok = true;
+    for (let k = 0; k < tokens.length; k++) {
+      const rn = row[i + k].n.replace(/[:()]/g, "");
+      if (rn !== tokens[k] && !(tokens[k].length >= 3 && rn.includes(tokens[k]))) { ok = false; break; }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+/** Extrai a tabela de Histórico: cada linha vira um registro datado separado (#4). */
+function extractMeldHistory(d, rows, fileIndex, pageIndex, conf) {
+  // Acha a linha de cabeçalho do histórico.
+  const headerRowIdx = rows.findIndex((r) => {
+    const txt = r.map((w) => w.n).join(" ");
+    return /data do exame/.test(txt) && /creatinina/.test(txt) && /meld/.test(txt);
+  });
+  if (headerRowIdx < 0) return;
+  // Linhas abaixo do cabeçalho que começam com uma data.
+  for (let i = headerRowIdx + 1; i < rows.length; i++) {
+    const row = rows[i];
+    const nums = row.map((w) => w.text);
+    const date = (nums.find((x) => /^\d{2}\/\d{2}\/\d{4}$/.test(x)) || "");
+    if (!date) continue;
+    const decimals = nums.filter((x) => /^\d{1,3}[.,]\d{1,2}$/.test(x));
+    const ints = nums.filter((x) => /^\d{1,2}$/.test(x));
+    const dates = nums.filter((x) => /^\d{2}\/\d{2}\/\d{4}$/.test(x));
+    const rec = {
+      date,
+      creat: decimals[0] || "", bili: decimals[1] || "", inr: decimals[2] || "",
+      meld: ints[0] || "", meldNa: ints[1] || ints[0] || "",
+      validade: dates[1] || "",
+      source: { fileIndex, pageIndex, confidence: conf },
+    };
+    d.meldHistory.push(rec);
+    // Candidato de MELD-Na do histórico — marcado como "historico".
+    if (rec.meldNa) collectMeldCandidate(d, rec.meldNa, rec.date, { name: "histórico" }, rec.source, "historico");
+  }
+}
+
+/** Coleta um candidato (data, valor) de MELD-Na com sua origem. */
+function collectMeldCandidate(d, value, date, f, src, kind) {
+  const v = Number(String(value).replace(",", "."));
+  if (!isFinite(v)) return;
+  d.meldCandidates.push({ value: v, raw: String(value), date: date || "", source: src || null, kind: kind || "lab", file: f && f.name });
+}
+
+/**
+ * Seleciona MELD-Na conforme regra confirmada:
+ *  Q1=a: janela de 3 meses relativa a HOJE.
+ *  Q3=a: se nada na janela, usa o mais recente com aviso.
+ *  Entre os elegíveis, escolhe o MAIOR valor; empate -> data mais recente.
+ *  (Q2=b: diálise já foi tratada na coleta — usamos "sem diálise" como padrão.)
+ */
+function selectMeldNa(d) {
+  d.notices = d.notices || {};
+  d.warnings = d.warnings || {};
+
+  // Candidatos "primários" = tela MELD + laudo laboratorial (formulário atual tem
+  // prioridade). Histórico NÃO entra no pool primário (item #4): só é usado para
+  // verificação/recuperação quando a linha casa com a data do exame atual.
+  const all = d.meldCandidates.slice();
+  const primary = all.filter((c) => c.kind === "tela" || c.kind === "lab");
+  const history = all.filter((c) => c.kind === "historico");
+
+  const now = Date.now();
+  const THREE_MONTHS = 92 * 86400000;
+  const within = (c) => c.date && (now - parseDate(c.date)) <= THREE_MONTHS && (now - parseDate(c.date)) >= -86400000;
+
+  let pool = primary.filter(within);
+  let outOfWindow = false, recovered = false;
+
+  if (!pool.length && primary.length) {
+    // Q3=a: fallback -> candidato primário mais recente, com aviso.
+    outOfWindow = true;
+    pool = [primary.filter((c) => c.date).sort((a, b) => parseDate(b.date) - parseDate(a.date))[0] || primary[0]];
+  }
+
+  if (!pool.length) {
+    // Sem valor primário legível. Recuperação pelo histórico SOMENTE se a linha
+    // casar com a data do exame atual (e a data do exame for legível).
+    if (d.meldData) {
+      const match = history.find((c) => c.date === d.meldData);
+      if (match) { pool = [match]; recovered = true; }
+    }
+    if (!pool.length) {
+      // Nada confiável: deixa vazio e sinaliza revisão (não inventa valor).
+      markReview(d, "meldNa");
+      if (!d.meldData) d.warnings.meldNa = "MELD-Na não lido e data do exame ilegível — selecione manualmente o registro correto.";
+      else d.warnings.meldNa = "MELD-Na não lido — revise; nenhum histórico casou com a data do exame.";
+      return;
+    }
+  }
+
+  // Maior valor; empate -> data mais recente.
+  pool.sort((a, b) => (b.value - a.value) || (parseDate(b.date) - parseDate(a.date)));
+  const chosen = pool[0];
+
+  d.meldNa = String(chosen.raw);
+  if (chosen.date && !d.meldData) d.meldData = chosen.date;
+  if (chosen.source) d.fieldSources.meldNa = chosen.source;
+
+  const inWin = primary.filter(within);
+  if (recovered) d.notices.meldNa = `MELD-Na recuperado do histórico (linha ${chosen.date}) por casar com a data do exame — confirme.`;
+  else if (outOfWindow) d.warnings.meldNa = `MELD-Na ${chosen.raw} (${chosen.date || "sem data"}) está fora da janela de 3 meses — revisar.`;
+  else if (inWin.length > 1) d.notices.meldNa = `Selecionado o maior MELD-Na dos últimos 3 meses (${chosen.raw}); ${inWin.length} exames considerados.`;
+}
+
 /* --- Helpers de extração --- */
 function matchName(t) {
   const patterns = [
@@ -1368,23 +1624,30 @@ function escapeHtml(s) {
  * VALIDAÇÕES (#3) — CPF, MELD recalculado, AFP > 200
  * ------------------------------------------------------------------------- */
 function runValidations(d) {
-  d.warnings = {};   // { campo: "mensagem" }  (erros/alertas)
-  d.notices = {};    // { campo: "mensagem" }  (informativos)
+  // Preserva avisos/notas já definidos na consolidação (ex.: seleção de MELD-Na).
+  d.warnings = d.warnings || {};
+  d.notices = d.notices || {};
 
   // CPF — dígitos verificadores
   if (d.cpf) {
     if (!isValidCpf(d.cpf)) d.warnings.cpf = "CPF inválido — verifique se o OCR leu os dígitos corretamente.";
   }
 
-  // MELD-Na recalculado a partir dos laboratoriais e comparado ao extraído
+  // MELD-Na recalculado SÓ como verificação — nunca substitui o valor lido (#5).
   const meldCalc = computeMeldNa(d.creatinina, d.bilirrubina, d.inr, d.sodio);
   if (meldCalc != null) {
     d.meldCalculado = String(meldCalc);
-    if (d.meldNa && Math.abs(Number(d.meldNa) - meldCalc) > 1) {
-      d.warnings.meldNa = `MELD-Na extraído (${d.meldNa}) difere do recalculado (${meldCalc}). Confira os laboratoriais.`;
-    } else if (!d.meldNa) {
-      d.notices.meldNa = `Sugerido pelo cálculo: MELD-Na ≈ ${meldCalc}.`;
+    // Só alerta de divergência se já houver valor lido e NÃO houver aviso prévio.
+    if (d.meldNa && !d.warnings.meldNa && Math.abs(Number(d.meldNa) - meldCalc) > 1) {
+      d.warnings.meldNa = `MELD-Na lido (${d.meldNa}) difere do recalculado (${meldCalc}). Confira os laboratoriais.`;
+    } else if (!d.meldNa && !d.warnings.meldNa) {
+      // Não preenche — apenas informa a estimativa para revisão manual.
+      d.notices.meldNa = `Estimativa pelo cálculo: MELD-Na ≈ ${meldCalc} (não preenchido automaticamente; revise).`;
     }
+  }
+  // Propaga os flags de revisão da tela MELD para os avisos exibidos.
+  if (d.reviewFlags) for (const [k, msg] of Object.entries(d.reviewFlags)) {
+    if (!d.warnings[k]) d.warnings[k] = msg;
   }
 
   // AFP > 200 ng/mL → suporta "critério combinado (1 exame + AFP)"
@@ -1471,7 +1734,8 @@ function sourceTargets(d) {
   const add = (field, value) => { if (value) t.push({ field, value: String(value) }); };
   add("paciente", d.paciente); add("dataNasc", d.dataNasc); add("idade", d.idade);
   add("cpf", d.cpf); add("rgct", d.rgct); add("equipe", d.equipe); add("hospital", d.hospital);
-  add("meldNa", d.meldNa); add("meldData", d.meldData);
+  add("meld", d.meld); add("meldNa", d.meldNa); add("meldData", d.meldData);
+  add("meldValidade", d.meldValidade); add("meldScreenDate", d.meldScreenDate);
   add("creatinina", d.creatinina); add("bilirrubina", d.bilirrubina); add("inr", d.inr); add("sodio", d.sodio);
   if (d.afp[0]) { add("afp1Data", d.afp[0].data); add("afp1Valor", d.afp[0].valor); }
   if (d.afp[1]) { add("afp2Data", d.afp[1].data); add("afp2Valor", d.afp[1].valor); }
@@ -1486,6 +1750,12 @@ function buildSourceMap(d) {
   d.sourceMap = {};
   const targets = sourceTargets(d);
   for (const { field, value } of targets) {
+    // Preferir a caixa PRECISA registrada na extração da tela MELD (#5).
+    const fs = d.fieldSources && d.fieldSources[field];
+    if (fs && fs.bbox) {
+      d.sourceMap[field] = { fileIndex: fs.fileIndex, pageIndex: fs.pageIndex, boxes: [fs.bbox], score: 999, confidence: fs.confidence };
+      continue;
+    }
     const hit = locateValue(value);
     if (hit) d.sourceMap[field] = hit;
   }
@@ -1609,7 +1879,8 @@ function fillReviewForm(d) {
 
   set("paciente", d.paciente); set("dataNasc", d.dataNasc); set("idade", d.idade);
   set("cpf", d.cpf); set("rgct", d.rgct); set("equipe", d.equipe); set("hospital", d.hospital);
-  set("meldNa", d.meldNa); set("meldData", d.meldData);
+  set("meld", d.meld); set("meldNa", d.meldNa); set("meldData", d.meldData);
+  set("meldValidade", d.meldValidade); set("meldScreenDate", d.meldScreenDate);
   set("creatinina", d.creatinina); set("bilirrubina", d.bilirrubina);
   set("inr", d.inr); set("sodio", d.sodio);
 
@@ -1769,6 +2040,9 @@ async function forceOcrPage(fileIndex, pageIndex) {
   const fb = $("#verForceOcr");
   if (fb) { fb.disabled = true; fb.textContent = "Executando OCR…"; }
   try {
+    // (#5) Preserva correções manuais feitas pelo usuário no formulário.
+    const manual = captureManualEdits();
+
     const pdf = await pdfjsLib.getDocument({ data: await f.file.arrayBuffer() }).promise;
     const page = await pdf.getPage(pageIndex + 1);
     let worker = state.ocrWorker;
@@ -1787,6 +2061,8 @@ async function forceOcrPage(fileIndex, pageIndex) {
     runValidations(state.data);
     computeFieldConfidence(state.data);
     buildSourceMap(state.data);
+    // Reaplica correções manuais por cima da re-extração.
+    applyManualEdits(state.data, manual);
     fillReviewForm(state.data);
     renderReportsSummary(state.reports);
     renderImagingList(state.data);
@@ -1928,6 +2204,33 @@ $("#generateBtn").addEventListener("click", () => {
   $("#step-report").scrollIntoView({ behavior: "smooth" });
 });
 
+/** (#5) Captura campos simples cujo valor no formulário difere do extraído (edições manuais). */
+function captureManualEdits() {
+  const form = $("#reviewForm");
+  if (!form) return {};
+  const prev = state.data || {};
+  const fields = ["meld","meldNa","meldData","meldValidade","meldScreenDate","creatinina","bilirrubina","inr","sodio",
+    "paciente","dataNasc","idade","cpf","rgct","equipe","hospital","tcToraxData","tcToraxResultado",
+    "imagemData","afpExameData","taceDatas","irressecabilidade","criterioBarcelona","indicacao","medico","crm","dataRelatorio"];
+  const edits = {};
+  for (const f of fields) {
+    const el = form.elements[f];
+    if (!el) continue;
+    const cur = (el.value || "").trim();
+    if (cur && cur !== (prev[f] || "")) edits[f] = cur; // usuário alterou/preencheu
+  }
+  return edits;
+}
+/** Reaplica edições manuais por cima do objeto de dados re-extraído. */
+function applyManualEdits(d, edits) {
+  if (!edits) return;
+  for (const [k, v] of Object.entries(edits)) {
+    d[k] = v;
+    if (d.reviewFlags && d.reviewFlags[k]) delete d.reviewFlags[k];
+    if (d.warnings && d.warnings[k]) delete d.warnings[k];
+  }
+}
+
 function readForm() {
   const form = $("#reviewForm");
   const g = (n) => (form.elements[n]?.value || "").trim();
@@ -1937,7 +2240,9 @@ function readForm() {
     ...prev,
     paciente: g("paciente"), dataNasc: g("dataNasc"), idade: g("idade"),
     cpf: g("cpf"), rgct: g("rgct"), equipe: g("equipe"), hospital: g("hospital"),
-    meldNa: g("meldNa"), meldData: g("meldData"), creatinina: g("creatinina"),
+    meld: g("meld"), meldNa: g("meldNa"), meldData: g("meldData"),
+    meldValidade: g("meldValidade"), meldScreenDate: g("meldScreenDate"),
+    creatinina: g("creatinina"),
     bilirrubina: g("bilirrubina"), inr: g("inr"), sodio: g("sodio"),
     afp: [
       { data: g("afp1Data"), valor: g("afp1Valor") },
