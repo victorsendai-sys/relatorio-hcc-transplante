@@ -230,5 +230,27 @@ console.log("\n== Teste 8: janela de 3 meses + maior valor ==");
   eq("Maior MELD-Na dentro de 3 meses (15, não 30)", d.meldNa, "15");
 }
 
+/* --- Teste 9: remoção de rodapé/assinatura/lixo de OCR --- */
+console.log("\n== Teste 9: stripSignatureNoise remove assinaturas/endereços/URLs/lixo ==");
+{
+  new Function(code + "\n;globalThis.__noise=stripSignatureNoise;")();
+  const strip = globalThis.__noise;
+  const noisy = "Figado com sinais de hepatopatia cronica. Lesao no segmento IVa. " +
+    "Dra SL Figueiredo CRM - 126918/SP Rua Napoleao de Barros, 737 - Vila Clementino - 04024-002 - Sao Paulo — SP " +
+    "Tel.: (11) 5576-4897 - https://www.hspmais.org.br/ EEE ese pm pa. " +
+    "Patient ID: 35999947$$$34020 Report Date: 03/07/2025 18:06 ACCH: 987175290 " +
+    "FERNANDA ANGELI BRAGA CRM/SP 148840 DRA. JULIA ESPINDOLA GUIMARAES CRM 271008-SP " +
+    "o o o o o o o o o o o o o";
+  const out = strip(noisy);
+  truthy("Mantém o conteúdo clínico", /hepatopatia cronica/i.test(out) && /segmento iva/i.test(out));
+  truthy("Remove CRM", !/crm/i.test(out));
+  truthy("Remove telefone", !/5576-4897/.test(out));
+  truthy("Remove URL", !/hspmais|https?:/i.test(out));
+  truthy("Remove Patient ID/ACC/Report Date", !/patient id|acc#|report date/i.test(out));
+  truthy("Remove endereço", !/napole[aã]o|clementino|04024/i.test(out));
+  truthy("Remove lixo de OCR", !/EEE|ese pm pa|\$\$\$/.test(out) && !/\bo o o o\b/.test(out));
+  console.log("   saída:", JSON.stringify(out));
+}
+
 console.log(`\n==== RESULTADO: ${passed} passaram, ${failed} falharam ====`);
 process.exit(failed ? 1 : 0);
