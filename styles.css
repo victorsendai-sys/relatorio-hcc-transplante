@@ -280,3 +280,52 @@ input.lowconf, textarea.lowconf { background: #fffaf0; border-color: #ead9a0; }
   .conf-banner, .imaging-list, .btn-danger, .session-badge { display: none !important; }
   .report .audit-footer { color: #000; }
 }
+
+/* =========================================================================
+ * Visão lado a lado — formulário (esq.) + documento com destaques (dir.)
+ * ========================================================================= */
+.review-split { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+.review-left { min-width: 0; }
+.review-right { position: sticky; top: 12px; min-width: 0; }
+
+.verifier:empty { display: none; }
+.verifier-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.verifier-head h4 { margin: 0; color: var(--blue); font-size: .98rem; }
+.verifier-ctrls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ver-doc { max-width: 240px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: .82rem; }
+.ver-toggle { font-size: .8rem; color: var(--text); display: flex; align-items: center; gap: 5px; font-weight: 600; }
+.ver-hint { color: var(--muted); font-size: .8rem; margin: 6px 0 8px; }
+.ver-pagetabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.pg-tab { border: 1px solid var(--border); background: #fff; border-radius: 6px; padding: 3px 10px; font-size: .78rem; cursor: pointer; }
+.pg-tab.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+
+.ver-stage { border: 1px solid var(--border); border-radius: 8px; overflow: auto; max-height: 72vh; background: #f3f5f7; }
+.ver-canvas { position: relative; width: 100%; }
+.ver-img { display: block; width: 100%; height: auto; }
+
+/* Destaques sobre o documento */
+.ver-mark {
+  position: absolute; border: 2px solid transparent; border-radius: 3px;
+  pointer-events: auto; cursor: pointer; transition: background .15s, border-color .15s;
+}
+.ver-mark.show { background: rgba(255, 213, 0, .30); border-color: rgba(230, 170, 0, .9); }
+.ver-mark.focus { background: rgba(255, 120, 0, .35); border-color: #e85d04; box-shadow: 0 0 0 2px rgba(232,93,4,.35); }
+.ver-mark:hover { background: rgba(255, 170, 0, .35); }
+
+/* Campo "piscando" ao ser localizado a partir do documento */
+input.flash, textarea.flash { animation: fieldflash 0.9s ease; }
+@keyframes fieldflash {
+  0%, 100% { background: inherit; }
+  30% { background: #fff2c2; box-shadow: 0 0 0 3px #ffe08a; }
+}
+
+/* Empilha em telas estreitas */
+@media (max-width: 900px) {
+  .review-split { grid-template-columns: 1fr; }
+  .review-right { position: static; }
+  .ver-stage { max-height: 60vh; }
+}
+@media print {
+  .review-right, .verifier { display: none !important; }
+  .review-split { display: block; }
+}
