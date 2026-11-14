@@ -1382,9 +1382,9 @@ function extractImaging(t, examType, ids) {
 
   return {
     tipo, nome: nome || tipo, data,
-    impressao: impressao.replace(/\s+/g, " ").trim(),
-    achados,                       // bullets de segmento/LI-RADS (se houver)
-    analiseCompleta: analiseFull,  // (#2) bloco completo preservado
+    impressao: stripSignatureNoise(impressao).replace(/\s+/g, " ").trim(),
+    achados: achados.map((a) => stripSignatureNoise(a)).filter(Boolean), // bullets limpos
+    analiseCompleta: analiseFull, // (#2) bloco completo preservado, sem rodapé
   };
 }
 
@@ -1402,11 +1402,62 @@ function grabBlock(t, labelRe) {
   return block.replace(/\s+/g, " ").trim();
 }
 
-/** Remove ruído de assinatura/rodapé/ID que vem de páginas de continuação. */
+/**
+ * Remove ruído de assinatura/rodapé/identificação de páginas de continuação:
+ * - assinaturas de médico (Dr/Dra ... CRM), CRMs soltos;
+ * - endereços, telefones, URLs, e-mails, CEPs;
+ * - linhas de sistema (Patient ID / ACC# / Report Date / liberado/assinado eletronicamente,
+ *   responsável técnico, data de impressão/emissão);
+ * - "lixo" de OCR (sequências de letras isoladas repetidas, pontilhados, "EEE ...").
+ * Primeiro corta a partir do início claro do rodapé; depois limpa fragmentos residuais.
+ */
 function stripSignatureNoise(s) {
   if (!s) return s;
-  const cut = s.search(/\b(patient id|acc#|report date|liberado eletronicamente|assinado por|dra?\.?\s+[a-zç]+\s+[a-zç]+\s+crm|crm\/?sp?\s*\d|responsa[vb]el|data da impress|impresso em)\b/i);
-  return cut > 0 ? s.slice(0, cut).trim() : s;
+
+  // 1) Corta a partir do início claro de um bloco de rodapé/assinatura.
+  const footerStart = s.search(
+    /\b(patient\s*id|acc#|report\s*date|liberado\s+eletronic|assinad[oa]\s+(?:por|eletronic)|exames?\s+assinados|respons[aá]ve(?:l|is)(?:\s+(?:pelo|t[eé]cnic))|data\s+d[ae]\s+impress|impresso\s+em|emiss[aã]o\s*:|rua\s+napole[aã]o|vila\s+clementino|hspmais)\b/i
+  );
+  let out = footerStart > 0 ? s.slice(0, footerStart) : s;
+
+  // 2) Corta a partir de uma ASSINATURA de médico (Dr/Dra ... CRM) — tudo a seguir é rodapé.
+  const sigStart = out.search(/\bdr(?:a|\.|a\.)?\s+[a-zà-ÿ][a-zà-ÿ'.\- ]{3,}?\bcrm\b/i);
+  if (sigStart > 0) out = out.slice(0, sigStart);
+
+  // 3) Divide em frases/linhas; descarta as que são SÓ ruído, preserva as clínicas.
+  const noiseOnly = [
+    /^dra?\.?\s+[a-zà-ÿ'.\- ]+\s+crm\b/i,                 // linha que começa com assinatura
+    /^crm\b/i,                                            // começa com CRM
+    /^rua\b/i,                                            // endereço
+    /^tel\.?\s*:?/i,                                       // telefone
+    /^(https?:\/\/|www\.)/i,                               // URL
+    /^[\s.o•*_=—-]{4,}$/i,                                 // pontilhados / "o o o o" / "===="
+    /^(?:[a-zà-ÿ]{1,3}\s+){3,}[a-zà-ÿ]{1,3}$/i,          // sequências curtas soltas (lixo)
+    /^(EEE|ese pm pa|fauoLeto|httos|patient\s*id|acc#|report\s*date)\b/i,
+  ];
+  const kept = out
+    .split(/\n|(?<=[.;])\s+/)                              // por linha e por frase
+    .map((l) => l.trim())
+    .filter((l) => l && !noiseOnly.some((re) => re.test(l)));
+
+  // 4) Remoções residuais DENTRO de frases que também têm conteúdo clínico.
+  out = kept.join(" ")
+    .replace(/https?:\/\/\S+|www\.\S+/gi, "")
+    .replace(/\b[\w.+-]+@[\w.-]+\.\w+\b/gi, "")
+    .replace(/\btel\.?\s*:?\s*\(?\d{2}\)?\s*\d{4,5}-?\d{4}\b/gi, "")
+    .replace(/\bdra?\.?\s+[a-zà-ÿ][a-zà-ÿ'.\- ]{3,}?\bcrm\s*\/?\s*sp?\s*[-:]?\s*\d+\/?\s*(?:sp)?\b/gi, "")
+    .replace(/\bcrm\s*\/?\s*sp?\s*[-:]?\s*\d+\/?\s*(?:sp)?\b/gi, "")
+    .replace(/\brua\s+[a-zà-ÿ].*?\b\d{5}-\d{3}\b[^.]*?(?:sp\b)?/gi, "")
+    .replace(/\b\d{5}-\d{3}\b/g, "")
+    .replace(/\$\$\$\S*/g, "")                             // "35999947$$34020"
+    .replace(/\bpatient\s*id\b|\bacc#|\breport\s*date\b/gi, "")
+    .replace(/(?:\bo\b[\s.]*){4,}/gi, " ")                 // "o o o o o"
+    .replace(/[•]{2,}/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\s+([.,;])/g, "$1")
+    .trim();
+
+  return out;
 }
 
 /** Mantém títulos reconhecíveis legíveis sem destruir siglas. */
