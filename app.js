@@ -16,7 +16,66 @@ const state = {
   files: [],        // { file, name, type, pages: [text], fullText, detected, pageMeta }
   data: {},         // campos extraídos/consolidados
   reports: [],      // (#1) relatórios individuais segmentados
-  ocrWorker: null,  // worker reutilizável p/ "Forçar OCR"
+  ocrPool: null,    // (P1/P2) pool persistente de workers de OCR
+};
+
+/* ---------------------------------------------------------------------------
+ * (P1/P2/P7) Pool de workers de OCR — paralelo, persistente e pré-carregável.
+ * ------------------------------------------------------------------------- */
+const OcrPool = {
+  workers: [],
+  size: 2,            // (P1) 2 workers em paralelo — bom equilíbrio velocidade/memória
+  _initing: null,
+  _rr: 0,
+
+  // Decide um tamanho seguro conforme os núcleos disponíveis.
+  decideSize() {
+    const cores = (navigator && navigator.hardwareConcurrency) || 4;
+    this.size = Math.max(1, Math.min(2, cores - 1)); // 1–2 workers
+  },
+
+  // (P7) Pré-carrega os workers (idempotente). Pode ser chamado ao escolher arquivos.
+  async ensure() {
+    if (this.workers.length) return this.workers;
+    if (this._initing) return this._initing;
+    this.decideSize();
+    this._initing = (async () => {
+      const made = [];
+      for (let i = 0; i < this.size; i++) {
+        const w = await Tesseract.createWorker("por", 1);
+        made.push(w);
+      }
+      this.workers = made;
+      return made;
+    })();
+    return this._initing;
+  },
+
+  // Executa tarefas de OCR em paralelo entre os workers. tasks: [{run(worker)}].
+  async map(tasks, onEach) {
+    await this.ensure();
+    const workers = this.workers;
+    let next = 0, done = 0;
+    const results = new Array(tasks.length);
+    await Promise.all(workers.map(async (w) => {
+      while (true) {
+        const i = next++;
+        if (i >= tasks.length) break;
+        results[i] = await tasks[i](w);
+        done++;
+        if (onEach) onEach(done, tasks.length);
+      }
+    }));
+    return results;
+  },
+
+  // Um worker qualquer (para "Forçar OCR" de uma página).
+  async one() { await this.ensure(); return this.workers[this._rr++ % this.workers.length]; },
+
+  async terminate() {
+    const ws = this.workers; this.workers = []; this._initing = null;
+    await Promise.all(ws.map((w) => { try { return w.terminate(); } catch (_) { return null; } }));
+  },
 };
 
 // --- Atalhos de DOM ---
@@ -43,14 +102,19 @@ dropzone.addEventListener("drop", (e) => {
 fileInput.addEventListener("change", () => addFiles([...fileInput.files]));
 
 function addFiles(files) {
+  let added = false;
   files
     .filter((f) => f.type === "application/pdf")
     .forEach((f) => {
       if (!state.files.some((x) => x.name === f.name && x.file.size === f.size)) {
         state.files.push({ file: f, name: f.name, type: null, pages: [], fullText: "", detected: "—" });
+        added = true;
       }
     });
   renderFileList();
+  // (P7) Pré-aquece o pool de OCR em segundo plano enquanto o usuário revisa a lista,
+  // para que a análise comece instantaneamente. Ignora falhas silenciosamente.
+  if (added && typeof Tesseract !== "undefined") { OcrPool.ensure().catch(() => {}); }
 }
 
 function renderFileList() {
@@ -90,17 +154,16 @@ async function runAnalysis() {
   clearBtn.disabled = true;
   progress.classList.remove("hidden");
 
-  let worker = null; // criado sob demanda apenas se alguma página precisar de OCR
-
   try {
     const totalFiles = state.files.length;
+
+    // ---- Fase 1: render + decisão digital/OCR (rápido, sem OCR). Coleta tarefas de OCR. ----
+    setProgress(0.02, "Preparando páginas…");
+    const ocrTasks = []; // { entry, pageIndex, page }
     for (let fi = 0; fi < totalFiles; fi++) {
       const entry = state.files[fi];
-      const base = fi / totalFiles;
-      setProgress(base, `Lendo "${entry.name}" (${fi + 1}/${totalFiles})…`);
-
       entry.pages = [];
-      entry.pageMeta = []; // metadados por página (ver processPage)
+      entry.pageMeta = [];
       entry.minConfidence = 100;
       entry.usedOcr = false;
 
@@ -109,33 +172,56 @@ async function runAnalysis() {
 
       for (let p = 1; p <= pdf.numPages; p++) {
         const page = await pdf.getPage(p);
-        const ensureWorker = async () => {
-          if (!worker) {
-            setProgress(base, "Carregando mecanismo de OCR (uma vez)…");
-            worker = await Tesseract.createWorker("por", 1, {
-              logger: (m) => {
-                if (m.status === "recognizing text")
-                  setProgress(base, `OCR "${entry.name}" — pág. ${p}/${pdf.numPages} · ${Math.round(m.progress * 100)}%`);
-              },
-            });
-          }
-          return worker;
-        };
-        const meta = await processPage(page, p, pdf.numPages, entry, base, ensureWorker, false);
-        entry.pages.push(meta.text);
-        entry.pageMeta.push(meta);
-        if (meta.source === "ocr") { entry.usedOcr = true; entry.minConfidence = Math.min(entry.minConfidence, meta.confidence); }
+        const prep = await preparePage(page); // render display + avalia texto digital
+        if (prep.useDigital) {
+          const meta = {
+            source: "digital", confidence: 100,
+            image: prep.display.image, width: prep.display.width, height: prep.display.height,
+            words: prep.digital.words, text: prep.digital.text,
+            coverage: prep.digital.coverage, canForceOcr: true, ocrHighRes: false,
+            ...pageIdentifiers(prep.digital.text),
+          };
+          entry.pageMeta[p - 1] = meta;
+        } else if (prep.blank) {
+          // (P4) Página em branco/quase vazia — não gasta OCR.
+          entry.pageMeta[p - 1] = {
+            source: "ocr", confidence: 100,
+            image: prep.display.image, width: prep.display.width, height: prep.display.height,
+            words: [], text: "", coverage: prep.digital.coverage, canForceOcr: true, ocrHighRes: false, blank: true,
+            ...pageIdentifiers(""),
+          };
+        } else {
+          entry.pageMeta[p - 1] = null; // placeholder; preenchido na fase 2
+          ocrTasks.push({ fi, entry, pageIndex: p - 1, page, display: prep.display, coverage: prep.digital.coverage });
+        }
       }
+    }
 
+    // ---- Fase 2: OCR em paralelo (pool de workers) só nas páginas necessárias. ----
+    if (ocrTasks.length) {
+      setProgress(0.08, `OCR de ${ocrTasks.length} página(s) em ${OcrPool.size} processos…`);
+      const tasks = ocrTasks.map((t) => async (worker) => {
+        const meta = await ocrPageWith(worker, t.page, t.display, t.coverage, false);
+        t.entry.pageMeta[t.pageIndex] = meta;
+        t.entry.usedOcr = true;
+        t.entry.minConfidence = Math.min(t.entry.minConfidence, meta.confidence);
+        t.display.canvasRef = null; t.page = null; // libera memória assim que a página termina
+        return true;
+      });
+      await OcrPool.map(tasks, (done, total) =>
+        setProgress(0.08 + 0.85 * (done / total), `OCR ${done}/${total} páginas…`));
+    }
+
+    // ---- Montagem final por arquivo ----
+    for (const entry of state.files) {
+      entry.pages = entry.pageMeta.map((m) => (m && m.text) || "");
       entry.fullText = entry.pages.join("\n");
       entry.detected = detectDocType(entry.fullText);
       entry.type = entry.detected;
-      renderFileList();
     }
+    renderFileList();
 
-    if (worker) await worker.terminate();
-    state.ocrWorker = null;
-    setProgress(0.97, "Separando relatórios e consolidando dados…");
+    setProgress(0.95, "Separando relatórios e consolidando dados…");
 
     // (#1) Segmenta cada PDF em relatórios individuais.
     state.reports = segmentReports(state.files);
@@ -156,8 +242,8 @@ async function runAnalysis() {
   } catch (err) {
     console.error(err);
     alert("Ocorreu um erro ao processar os documentos: " + err.message);
-    if (worker) { try { await worker.terminate(); } catch (_) {} }
   } finally {
+    // (P2) Mantém o pool vivo para "Forçar OCR" posterior; não terminamos aqui.
     progress.classList.add("hidden");
     analyzeBtn.disabled = false;
     clearBtn.disabled = false;
@@ -170,36 +256,25 @@ function setProgress(ratio, text) {
 }
 
 /**
- * Processa uma página: decide digital x OCR (por cobertura de texto), rasteriza
- * imagem leve p/ exibição e extrai identificadores (p/ segmentação em relatórios).
- * forceOcr=true ignora a heurística e sempre faz OCR (#5 botão "Forçar OCR").
+ * Fase 1: renderiza a imagem de exibição e decide digital x OCR (sem rodar OCR).
+ * Retorna { display, digital, useDigital, blank }.
  */
-async function processPage(page, pageNo, totalPages, entry, base, ensureWorker, forceOcr, highRes) {
-  // Imagem leve (JPEG) para a UI/verificador — mantém tudo responsivo (#B).
+async function preparePage(page, forceOcr) {
   const display = await renderDisplay(page);
-
-  // Avalia a camada de texto digital e sua COBERTURA na página (#5 + #D).
   const digital = await extractDigitalText(page, display.scale);
   const useDigital = !forceOcr && digital.coverage.ok;
+  const blank = !useDigital && digital.coverage.chars === 0 && isBlankImage(display); // (P4)
+  return { display, digital, useDigital, blank };
+}
 
-  if (useDigital) {
-    return {
-      source: "digital", confidence: 100,
-      image: display.image, width: display.width, height: display.height,
-      words: digital.words, text: digital.text,
-      coverage: digital.coverage, canForceOcr: true, ocrHighRes: false,
-      ...pageIdentifiers(digital.text),
-    };
-  }
-
-  // (#A/#B) Por padrão, OCR RÁPIDO (~220 dpi, JPEG). Alta resolução só sob demanda.
-  const w = await ensureWorker();
-  const q = highRes ? "alta resolução" : "rápido";
-  setProgress(base, `OCR (${q}) "${entry.name}" — página ${pageNo}/${totalPages}…`);
+/**
+ * Fase 2: executa OCR de UMA página usando um worker do pool.
+ * highRes=true usa 300 dpi PNG; senão ~220 dpi JPEG em tons de cinza (P3).
+ */
+async function ocrPageWith(worker, page, display, coverage, highRes) {
   const ocrImg = highRes ? await renderForOcr(page) : await renderForOcrFast(page);
-  const { data } = await w.recognize(ocrImg.image, {}, { blocks: true, text: true });
+  const { data } = await worker.recognize(ocrImg.image, {}, { blocks: true, text: true });
   const conf = typeof data.confidence === "number" ? data.confidence : 60;
-  // Converte caixas da escala de OCR para a escala de exibição.
   const k = display.scale / ocrImg.scale;
   const words = collectWords(data).map((wd) => {
     const b = wd.bbox || wd;
@@ -209,10 +284,29 @@ async function processPage(page, pageNo, totalPages, entry, base, ensureWorker, 
   return {
     source: "ocr", confidence: conf,
     image: display.image, width: display.width, height: display.height,
-    // canForceOcr: permite reprocessar em alta resolução enquanto ainda não foi feito.
-    words, text, coverage: digital.coverage, canForceOcr: !highRes, ocrHighRes: !!highRes,
+    words, text, coverage, canForceOcr: !highRes, ocrHighRes: !!highRes,
     ...pageIdentifiers(text),
   };
+}
+
+/** (P4) Detecta página praticamente em branco amostrando pixels da imagem de exibição. */
+function isBlankImage(display) {
+  try {
+    const img = display.canvasRef;
+    if (!img) return false;
+    const ctx = img.getContext("2d", { willReadFrequently: true });
+    const { width: W, height: H } = img;
+    const step = Math.max(4, Math.floor(Math.min(W, H) / 60));
+    let dark = 0, n = 0;
+    const d = ctx.getImageData(0, 0, W, H).data;
+    for (let y = 0; y < H; y += step) for (let x = 0; x < W; x += step) {
+      const i = (y * W + x) * 4;
+      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      if (lum < 200) dark++;
+      n++;
+    }
+    return n > 0 && dark / n < 0.004; // <0.4% de pixels escuros => em branco
+  } catch (_) { return false; }
 }
 
 /** (#9) Extrai texto digital + caixas + COBERTURA (área e dispersão vertical). */
@@ -285,7 +379,8 @@ async function renderDisplay(page) {
   canvas.width = viewport.width; canvas.height = viewport.height;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   await page.render({ canvasContext: ctx, viewport }).promise;
-  return { image: canvas.toDataURL("image/jpeg", 0.82), width: viewport.width, height: viewport.height, scale };
+  // canvasRef usado só para detecção de página em branco (P4); não é retido no estado.
+  return { image: canvas.toDataURL("image/jpeg", 0.82), width: viewport.width, height: viewport.height, scale, canvasRef: canvas };
 }
 
 /** (#6) Imagem de alta qualidade (PNG, ~300 dpi) só para o OCR — melhor precisão. */
@@ -314,7 +409,25 @@ async function renderForOcrFast(page) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvasContext: ctx, viewport }).promise;
+  // (P3) Tons de cinza + leve aumento de contraste — costuma ser mais rápido e preciso no OCR.
+  toGrayscaleContrast(ctx, canvas.width, canvas.height);
   return { image: canvas.toDataURL("image/jpeg", 0.85), width: viewport.width, height: viewport.height, scale };
+}
+
+/** (P3) Converte o canvas para tons de cinza e aplica um contraste suave in-place. */
+function toGrayscaleContrast(ctx, w, h) {
+  try {
+    const img = ctx.getImageData(0, 0, w, h);
+    const d = img.data;
+    const contrast = 1.15, mid = 128;
+    for (let i = 0; i < d.length; i += 4) {
+      let g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      g = (g - mid) * contrast + mid;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      d[i] = d[i + 1] = d[i + 2] = g;
+    }
+    ctx.putImageData(img, 0, 0);
+  } catch (_) { /* se falhar, mantém a imagem colorida */ }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1503,12 +1616,9 @@ async function forceOcrPage(fileIndex, pageIndex) {
 
     const pdf = await pdfjsLib.getDocument({ data: await f.file.arrayBuffer() }).promise;
     const page = await pdf.getPage(pageIndex + 1);
-    let worker = state.ocrWorker;
-    const ensureWorker = async () => {
-      if (!worker) { worker = await Tesseract.createWorker("por", 1); state.ocrWorker = worker; }
-      return worker;
-    };
-    const meta = await processPage(page, pageIndex + 1, pdf.numPages, f, 0, ensureWorker, true, true);
+    const worker = await OcrPool.one();          // (P2) reutiliza um worker do pool
+    const prep = await preparePage(page, true);  // força OCR
+    const meta = await ocrPageWith(worker, page, prep.display, prep.digital.coverage, true); // alta resolução
     f.pageMeta[pageIndex] = meta;
     f.pages[pageIndex] = meta.text;
     f.fullText = f.pages.join("\n");
