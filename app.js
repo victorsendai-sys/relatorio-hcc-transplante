@@ -98,7 +98,7 @@ async function runAnalysis() {
       setProgress(base, `Lendo "${entry.name}" (${fi + 1}/${totalFiles})…`);
 
       entry.pages = [];
-      entry.pageMeta = []; // { source: "digital"|"ocr", confidence }
+      entry.pageMeta = []; // { source, confidence, image, width, height, words:[{text,x,y,w,h}] }
       entry.minConfidence = 100;
       entry.usedOcr = false;
 
@@ -107,13 +107,20 @@ async function runAnalysis() {
       for (let p = 1; p <= pdf.numPages; p++) {
         const page = await pdf.getPage(p);
 
-        // (#9) Primeiro tenta a camada de texto digital — rápido e sem erros de OCR.
-        const digital = await extractDigitalText(page);
-        if (digital && digital.replace(/\s/g, "").length > 40) {
-          entry.pages.push(digital);
-          entry.pageMeta.push({ source: "digital", confidence: 100 });
+        // Rasteriza a página para exibição lado a lado (sempre).
+        const render = await pageToImage(page);
+
+        // (#9) Primeiro tenta a camada de texto digital — rápido, exato e com posições.
+        const digital = await extractDigitalText(page, render.scale);
+        if (digital.text && digital.text.replace(/\s/g, "").length > 40) {
+          entry.pages.push(digital.text);
+          entry.pageMeta.push({
+            source: "digital", confidence: 100,
+            image: render.image, width: render.width, height: render.height,
+            words: digital.words,
+          });
         } else {
-          // (#8) Só então faz OCR da imagem rasterizada.
+          // (#8) Só então faz OCR da imagem rasterizada — com caixas de palavras.
           entry.usedOcr = true;
           if (!worker) {
             setProgress(base, "Carregando mecanismo de OCR (uma vez)…");
@@ -126,11 +133,17 @@ async function runAnalysis() {
             });
           }
           setProgress(base, `OCR "${entry.name}" — página ${p}/${pdf.numPages}…`);
-          const img = await pageToImage(page);
-          const { data } = await worker.recognize(img);
+          const { data } = await worker.recognize(render.image, {}, { blocks: true, text: true });
           entry.pages.push(data.text || "");
           const conf = typeof data.confidence === "number" ? data.confidence : 60;
-          entry.pageMeta.push({ source: "ocr", confidence: conf });
+          const words = collectWords(data).map((w) => {
+            const b = w.bbox || w;
+            return { text: w.text || "", x: b.x0, y: b.y0, w: b.x1 - b.x0, h: b.y1 - b.y0 };
+          }).filter((w) => w.text && isFinite(w.x) && isFinite(w.y) && w.w > 0 && w.h > 0);
+          entry.pageMeta.push({
+            source: "ocr", confidence: conf,
+            image: render.image, width: render.width, height: render.height, words,
+          });
           entry.minConfidence = Math.min(entry.minConfidence, conf);
         }
       }
@@ -147,8 +160,10 @@ async function runAnalysis() {
     state.data = consolidate(state.files);
     runValidations(state.data);           // (#3) validações
     computeFieldConfidence(state.data);    // (#2) confiança por campo
+    buildSourceMap(state.data);            // mapeia cada campo -> origem no documento
     fillReviewForm(state.data);
     renderRawOcr(state.files);
+    renderVerifier();                      // visão lado a lado (campos x documento)
     saveSession();                         // (#6) persiste automaticamente
 
     setProgress(1, "Concluído.");
@@ -170,41 +185,68 @@ function setProgress(ratio, text) {
   if (text) progressText.textContent = text;
 }
 
-/** (#9) Extrai a camada de texto digital de uma página do PDF (se existir). */
-async function extractDigitalText(page) {
+/** (#9) Extrai a camada de texto digital de uma página + caixas (em pixels da imagem). */
+async function extractDigitalText(page, scale) {
   try {
     const content = await page.getTextContent();
-    if (!content.items || !content.items.length) return "";
-    // Reconstrói linhas a partir das posições Y dos itens.
+    if (!content.items || !content.items.length) return { text: "", words: [] };
+    const vp = page.getViewport({ scale });
+    const words = [];
     const lines = new Map();
     for (const item of content.items) {
-      const y = Math.round(item.transform[5]);
+      const tx = item.transform[4], ty = item.transform[5];
+      const y = Math.round(ty);
       if (!lines.has(y)) lines.set(y, []);
-      lines.get(y).push({ x: item.transform[4], s: item.str });
+      lines.get(y).push({ x: tx, s: item.str });
+      // Converte a posição PDF (origem inferior-esquerda) para pixels da imagem.
+      if (item.str && item.str.trim()) {
+        const [px, py] = vp.convertToViewportPoint(tx, ty);
+        const w = (item.width || item.str.length * 4) * scale;
+        const h = (item.height || 8) * scale;
+        words.push({ text: item.str.trim(), x: px, y: py - h, w, h });
+      }
     }
-    return [...lines.entries()]
+    const text = [...lines.entries()]
       .sort((a, b) => b[0] - a[0])
       .map(([, arr]) => arr.sort((a, b) => a.x - b.x).map((o) => o.s).join(" "))
       .join("\n")
       .replace(/[ \t]{2,}/g, " ");
+    return { text, words };
   } catch (_) {
-    return "";
+    return { text: "", words: [] };
   }
 }
 
-/** (#8) Rasteriza a página em imagem, limitando a largura para acelerar o OCR. */
+/** Coleta as palavras do resultado do Tesseract v5 (de data.words ou dos blocks aninhados). */
+function collectWords(data) {
+  if (data.words && data.words.length) return data.words;
+  const out = [];
+  const blocks = data.blocks || [];
+  for (const b of blocks) {
+    for (const par of (b.paragraphs || [])) {
+      for (const line of (par.lines || [])) {
+        for (const w of (line.words || [])) out.push(w);
+      }
+    }
+  }
+  return out;
+}
+
+/** (#8) Rasteriza a página em imagem (limitando a largura) e devolve dimensões e escala. */
 async function pageToImage(page) {
-  let viewport = page.getViewport({ scale: 2.0 });
+  let scale = 2.0;
+  let viewport = page.getViewport({ scale });
   const MAX_W = 2000; // (#8) downscale de scans gigantes
   if (viewport.width > MAX_W) {
-    viewport = page.getViewport({ scale: (2.0 * MAX_W) / viewport.width });
+    scale = (2.0 * MAX_W) / viewport.width;
+    viewport = page.getViewport({ scale });
   }
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toDataURL("image/png");
+  return { image: canvas.toDataURL("image/jpeg", 0.8), width: viewport.width, height: viewport.height, scale };
 }
 
 /* ---------------------------------------------------------------------------
@@ -625,6 +667,87 @@ function computeFieldConfidence(d) {
 }
 
 /* ---------------------------------------------------------------------------
+ * MAPA DE ORIGEM — liga cada campo ao local no documento (página + caixa)
+ * ------------------------------------------------------------------------- */
+// Campos do formulário e o(s) valor(es) a localizar no documento.
+function sourceTargets(d) {
+  const t = [];
+  const add = (field, value) => { if (value) t.push({ field, value: String(value) }); };
+  add("paciente", d.paciente); add("dataNasc", d.dataNasc); add("idade", d.idade);
+  add("cpf", d.cpf); add("rgct", d.rgct); add("equipe", d.equipe); add("hospital", d.hospital);
+  add("meldNa", d.meldNa); add("meldData", d.meldData);
+  add("creatinina", d.creatinina); add("bilirrubina", d.bilirrubina); add("inr", d.inr); add("sodio", d.sodio);
+  if (d.afp[0]) { add("afp1Data", d.afp[0].data); add("afp1Valor", d.afp[0].valor); }
+  if (d.afp[1]) { add("afp2Data", d.afp[1].data); add("afp2Valor", d.afp[1].valor); }
+  if (d.afp[2]) { add("afp3Data", d.afp[2].data); add("afp3Valor", d.afp[2].valor); }
+  add("imagemData", d.imagemData); add("tcToraxData", d.tcToraxData); add("afpExameData", d.afpExameData);
+  add("taceDatas", d.taceDatas); add("medico", d.medico); add("crm", d.crm);
+  return t;
+}
+
+/** Constrói d.sourceMap: { field: { fileIndex, pageIndex, boxes:[{x,y,w,h}], norm } }. */
+function buildSourceMap(d) {
+  d.sourceMap = {};
+  const targets = sourceTargets(d);
+  for (const { field, value } of targets) {
+    const hit = locateValue(value);
+    if (hit) d.sourceMap[field] = hit;
+  }
+}
+
+/** Procura o valor nas caixas de palavras de todas as páginas; retorna a melhor correspondência. */
+function locateValue(value) {
+  const want = tokenize(value);
+  if (!want.length) return null;
+  let best = null;
+
+  for (let fi = 0; fi < state.files.length; fi++) {
+    const f = state.files[fi];
+    if (!f.pageMeta) continue;
+    for (let pi = 0; pi < f.pageMeta.length; pi++) {
+      const meta = f.pageMeta[pi];
+      const words = meta.words || [];
+      if (!words.length) continue;
+      const normWords = words.map((w) => ({ ...w, n: normToken(w.text) }));
+
+      // Caso 1: valor com 1 token — acha a palavra que contém/igual.
+      if (want.length === 1) {
+        const w0 = want[0];
+        const idx = normWords.findIndex((w) => w.n === w0 || (w0.length >= 3 && w.n.includes(w0)));
+        if (idx >= 0) {
+          const cand = { fileIndex: fi, pageIndex: pi, boxes: [box(normWords[idx])], score: w0.length };
+          if (!best || cand.score > best.score) best = cand;
+        }
+        continue;
+      }
+      // Caso 2: multi-token — procura janela consecutiva que bata a maioria dos tokens.
+      for (let s = 0; s < normWords.length; s++) {
+        let matched = 0;
+        const boxes = [];
+        for (let k = 0; k < want.length && s + k < normWords.length; k++) {
+          const w = normWords[s + k];
+          if (w.n === want[k] || (want[k].length >= 3 && w.n.includes(want[k]))) {
+            matched++; boxes.push(box(w));
+          } else break;
+        }
+        if (matched >= Math.ceil(want.length * 0.6) && matched >= 1) {
+          const cand = { fileIndex: fi, pageIndex: pi, boxes, score: matched * 10 };
+          if (!best || cand.score > best.score) best = cand;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function box(w) { return { x: w.x, y: w.y, w: w.w, h: w.h }; }
+function tokenize(v) { return normToken(v).split(/\s+/).filter((x) => x.length >= 1); }
+function normToken(s) {
+  return String(s).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w/.,-]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/* ---------------------------------------------------------------------------
  * PERSISTÊNCIA LOCAL (#6) — salvar/recarregar sessão no navegador
  * ------------------------------------------------------------------------- */
 const STORAGE_KEY = "hcc_report_session_v1";
@@ -682,6 +805,10 @@ function fillReviewForm(d) {
       el.classList.remove("missing", "warn", "lowconf");
       clearFieldMessage(el);
     });
+    // Ao focar/clicar o campo, destaca a origem no documento.
+    const onFocus = () => highlightSource(name);
+    el.addEventListener("focus", onFocus);
+    el.addEventListener("click", onFocus);
   };
 
   set("paciente", d.paciente); set("dataNasc", d.dataNasc); set("idade", d.idade);
@@ -756,6 +883,131 @@ function renderImagingList(d) {
         ${ach ? `<ul class="img-ach">${ach}</ul>` : ""}
       </div>`;
     }).join("");
+}
+
+/* ---------------------------------------------------------------------------
+ * VISÃO LADO A LADO — documento + destaque da origem de cada campo
+ * ------------------------------------------------------------------------- */
+const verifierState = { fileIndex: 0, pageIndex: 0, showAll: false };
+
+function renderVerifier() {
+  const host = $("#verifier");
+  if (!host) return;
+  const files = state.files.filter((f) => f.pageMeta && f.pageMeta.length);
+  if (!files.length) { host.innerHTML = ""; return; }
+
+  // Mapeia índice filtrado -> índice real em state.files
+  const realIdx = state.files.map((f, i) => ({ f, i })).filter((x) => x.f.pageMeta?.length).map((x) => x.i);
+  if (!realIdx.includes(verifierState.fileIndex)) verifierState.fileIndex = realIdx[0];
+
+  const f = state.files[verifierState.fileIndex];
+  if (verifierState.pageIndex >= f.pageMeta.length) verifierState.pageIndex = 0;
+
+  const docOptions = realIdx.map((ri) => {
+    const ff = state.files[ri];
+    return `<option value="${ri}" ${ri === verifierState.fileIndex ? "selected" : ""}>${escapeHtml(ff.name)} — ${escapeHtml(ff.detected)}</option>`;
+  }).join("");
+
+  const pageTabs = f.pageMeta.map((_, pi) =>
+    `<button class="pg-tab ${pi === verifierState.pageIndex ? "active" : ""}" data-pi="${pi}">Pág. ${pi + 1}</button>`
+  ).join("");
+
+  host.innerHTML = `
+    <div class="verifier-head">
+      <h4>Verificação — origem dos dados</h4>
+      <div class="verifier-ctrls">
+        <select id="verDoc" class="ver-doc">${docOptions}</select>
+        <label class="ver-toggle"><input type="checkbox" id="verShowAll" ${verifierState.showAll ? "checked" : ""}> Mostrar todos os destaques</label>
+      </div>
+    </div>
+    <p class="ver-hint">Clique em um campo do formulário para destacar onde ele aparece no documento. ${f.pageMeta[verifierState.pageIndex].source === "ocr" ? "Página lida por OCR." : "Página com texto digital."}</p>
+    <div class="ver-pagetabs">${pageTabs}</div>
+    <div class="ver-stage" id="verStage"></div>
+  `;
+
+  $("#verDoc").addEventListener("change", (e) => {
+    verifierState.fileIndex = Number(e.target.value);
+    verifierState.pageIndex = 0;
+    renderVerifier();
+  });
+  $("#verShowAll").addEventListener("change", (e) => {
+    verifierState.showAll = e.target.checked;
+    drawStage();
+  });
+  host.querySelectorAll(".pg-tab").forEach((b) =>
+    b.addEventListener("click", () => { verifierState.pageIndex = Number(b.dataset.pi); renderVerifier(); })
+  );
+
+  drawStage();
+}
+
+function drawStage(focusField) {
+  const stage = $("#verStage");
+  if (!stage) return;
+  const f = state.files[verifierState.fileIndex];
+  if (!f || !f.pageMeta || !f.pageMeta[verifierState.pageIndex]) return;
+  const meta = f.pageMeta[verifierState.pageIndex];
+  const d = state.data || {};
+  const map = d.sourceMap || {};
+
+  // Destaques desta página.
+  const marks = [];
+  for (const [field, loc] of Object.entries(map)) {
+    if (loc.fileIndex !== verifierState.fileIndex || loc.pageIndex !== verifierState.pageIndex) continue;
+    const show = verifierState.showAll || field === focusField;
+    loc.boxes.forEach((b) => marks.push({ field, b, show, focus: field === focusField }));
+  }
+
+  const overlays = marks.map((m) =>
+    `<div class="ver-mark ${m.show ? "show" : ""} ${m.focus ? "focus" : ""}"
+          data-field="${m.field}"
+          style="left:${(m.b.x / meta.width) * 100}%;top:${(m.b.y / meta.height) * 100}%;width:${(m.b.w / meta.width) * 100}%;height:${(m.b.h / meta.height) * 100}%;"
+          title="${escapeHtml(m.field)}"></div>`
+  ).join("");
+
+  stage.innerHTML = `
+    <div class="ver-canvas" style="aspect-ratio:${meta.width}/${meta.height}">
+      <img src="${meta.image}" alt="Documento" class="ver-img" />
+      ${overlays}
+    </div>`;
+
+  // Clicar num destaque foca o campo correspondente.
+  stage.querySelectorAll(".ver-mark").forEach((el) =>
+    el.addEventListener("click", () => {
+      const input = document.querySelector(`#reviewForm [name="${el.dataset.field}"]`);
+      if (input) { input.focus(); input.scrollIntoView({ behavior: "smooth", block: "center" }); flashField(input); }
+    })
+  );
+}
+
+/** Chamado quando um campo recebe foco: mostra sua origem no documento. */
+function highlightSource(field) {
+  if (!state.files.some((f) => f.pageMeta && f.pageMeta.length)) return; // sessão restaurada sem imagens
+  const d = state.data || {};
+  const loc = (d.sourceMap || {})[field];
+  if (!loc) { setVerStatus(field, false); return; }
+  // Troca para o documento/página corretos e desenha o destaque.
+  if (loc.fileIndex !== verifierState.fileIndex || loc.pageIndex !== verifierState.pageIndex) {
+    verifierState.fileIndex = loc.fileIndex;
+    verifierState.pageIndex = loc.pageIndex;
+    renderVerifier();
+  }
+  drawStage(field);
+  setVerStatus(field, true);
+  const mark = document.querySelector(`#verStage .ver-mark[data-field="${field}"]`);
+  if (mark) mark.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function setVerStatus(field, found) {
+  const el = document.querySelector(`#reviewForm [name="${field}"]`);
+  if (!el) return;
+  clearFieldMessage(el);
+  if (!found && el.value) attachFieldMessage(el, field, null, "origem não localizada no documento — confira manualmente.");
+}
+
+function flashField(input) {
+  input.classList.add("flash");
+  setTimeout(() => input.classList.remove("flash"), 900);
 }
 
 function renderRawOcr(files) {
