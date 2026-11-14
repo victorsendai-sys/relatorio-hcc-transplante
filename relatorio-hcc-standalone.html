@@ -737,11 +737,11 @@ function setProgress(ratio, text) {
  * imagem leve p/ exibição e extrai identificadores (p/ segmentação em relatórios).
  * forceOcr=true ignora a heurística e sempre faz OCR (#5 botão "Forçar OCR").
  */
-async function processPage(page, pageNo, totalPages, entry, base, ensureWorker, forceOcr) {
+async function processPage(page, pageNo, totalPages, entry, base, ensureWorker, forceOcr, highRes) {
   // Imagem leve (JPEG) para a UI/verificador — mantém tudo responsivo (#B).
   const display = await renderDisplay(page);
 
-  // Avalia a camada de texto digital e sua COBERTURA na página (#5).
+  // Avalia a camada de texto digital e sua COBERTURA na página (#5 + #D).
   const digital = await extractDigitalText(page, display.scale);
   const useDigital = !forceOcr && digital.coverage.ok;
 
@@ -750,15 +750,16 @@ async function processPage(page, pageNo, totalPages, entry, base, ensureWorker, 
       source: "digital", confidence: 100,
       image: display.image, width: display.width, height: display.height,
       words: digital.words, text: digital.text,
-      coverage: digital.coverage, canForceOcr: true,
+      coverage: digital.coverage, canForceOcr: true, ocrHighRes: false,
       ...pageIdentifiers(digital.text),
     };
   }
 
-  // OCR em alta qualidade (PNG ~300dpi) (#6).
+  // (#A/#B) Por padrão, OCR RÁPIDO (~220 dpi, JPEG). Alta resolução só sob demanda.
   const w = await ensureWorker();
-  setProgress(base, `OCR "${entry.name}" — página ${pageNo}/${totalPages}…`);
-  const ocrImg = await renderForOcr(page);
+  const q = highRes ? "alta resolução" : "rápido";
+  setProgress(base, `OCR (${q}) "${entry.name}" — página ${pageNo}/${totalPages}…`);
+  const ocrImg = highRes ? await renderForOcr(page) : await renderForOcrFast(page);
   const { data } = await w.recognize(ocrImg.image, {}, { blocks: true, text: true });
   const conf = typeof data.confidence === "number" ? data.confidence : 60;
   // Converte caixas da escala de OCR para a escala de exibição.
@@ -771,7 +772,8 @@ async function processPage(page, pageNo, totalPages, entry, base, ensureWorker, 
   return {
     source: "ocr", confidence: conf,
     image: display.image, width: display.width, height: display.height,
-    words, text, coverage: digital.coverage, canForceOcr: false,
+    // canForceOcr: permite reprocessar em alta resolução enquanto ainda não foi feito.
+    words, text, coverage: digital.coverage, canForceOcr: !highRes, ocrHighRes: !!highRes,
     ...pageIdentifiers(text),
   };
 }
@@ -808,12 +810,13 @@ async function extractDigitalText(page, scale) {
       .join("\n")
       .replace(/[ \t]{2,}/g, " ");
 
-    // (#5) Cobertura: fração da área coberta por texto E dispersão vertical na página.
+    // (#5/#D) Cobertura: fração da área coberta por texto E dispersão vertical.
     const ratio = textArea / pageArea;
     const spread = isFinite(minY) ? (maxY - minY) / vp.height : 0;
-    // Aceita texto digital somente se houver cobertura razoável E o texto não estiver
-    // concentrado só no topo (cabeçalho). Caso contrário, faz OCR.
-    const ok = chars > 120 && ratio > 0.012 && spread > 0.35;
+    // Página claramente digital (muito texto bem distribuído) -> pula OCR (mais rápido).
+    // Página com pouco texto OU só no topo (cabeçalho de scan) -> vai para OCR.
+    const clearlyDigital = chars > 400 && spread > 0.45;       // laudo/carta digitais
+    const ok = clearlyDigital || (chars > 150 && ratio > 0.015 && spread > 0.40);
     return { text, words, coverage: { ok, ratio: +ratio.toFixed(4), spread: +spread.toFixed(2), chars } };
   } catch (_) {
     return { text: "", words: [], coverage: { ok: false, ratio: 0, spread: 0, chars: 0 } };
@@ -861,6 +864,20 @@ async function renderForOcr(page) {
   ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvasContext: ctx, viewport }).promise;
   return { image: canvas.toDataURL("image/png"), width: viewport.width, height: viewport.height, scale };
+}
+
+/** (#A) OCR RÁPIDO: ~220 dpi em JPEG — bem mais rápido, boa precisão para o 1º passe. */
+async function renderForOcrFast(page) {
+  let scale = 220 / 72; // ≈ 3.06
+  let viewport = page.getViewport({ scale });
+  const MAX_W = 2400;
+  if (viewport.width > MAX_W) { scale = scale * (MAX_W / viewport.width); viewport = page.getViewport({ scale }); }
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width; canvas.height = viewport.height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return { image: canvas.toDataURL("image/jpeg", 0.85), width: viewport.width, height: viewport.height, scale };
 }
 
 /* ---------------------------------------------------------------------------
@@ -1996,10 +2013,14 @@ function renderVerifier() {
   ).join("");
 
   const curMeta = f.pageMeta[verifierState.pageIndex];
-  const forceBtn = curMeta.source === "digital"
-    ? `<button id="verForceOcr" class="btn btn-ghost btn-sm" type="button">🔁 Forçar OCR nesta página</button>`
+  // Botão disponível para páginas digitais (forçar OCR) e para OCR rápido (refinar em alta resolução).
+  const forceBtn = (curMeta.source === "digital" || !curMeta.ocrHighRes)
+    ? `<button id="verForceOcr" class="btn btn-ghost btn-sm" type="button">🔁 ${curMeta.source === "digital" ? "Forçar OCR" : "Reprocessar em alta resolução"}</button>`
     : "";
   const cov = curMeta.coverage ? ` (cobertura ${Math.round((curMeta.coverage.ratio || 0) * 100)}%)` : "";
+  const fonte = curMeta.source === "ocr"
+    ? (curMeta.ocrHighRes ? "OCR (alta resolução, 300 dpi)" : "OCR (rápido, ~220 dpi)")
+    : "texto digital" + cov;
 
   host.innerHTML = `
     <div class="verifier-head">
@@ -2010,7 +2031,7 @@ function renderVerifier() {
       </div>
     </div>
     <p class="ver-hint">Clique em um campo para destacar sua origem. Fonte desta página:
-      <strong>${curMeta.source === "ocr" ? "OCR (300 dpi)" : "texto digital" + cov}</strong>. ${forceBtn}</p>
+      <strong>${fonte}</strong>. ${forceBtn}</p>
     <div class="ver-pagetabs">${pageTabs}</div>
     <div class="ver-stage" id="verStage"></div>
   `;
@@ -2050,7 +2071,7 @@ async function forceOcrPage(fileIndex, pageIndex) {
       if (!worker) { worker = await Tesseract.createWorker("por", 1); state.ocrWorker = worker; }
       return worker;
     };
-    const meta = await processPage(page, pageIndex + 1, pdf.numPages, f, 0, ensureWorker, true);
+    const meta = await processPage(page, pageIndex + 1, pdf.numPages, f, 0, ensureWorker, true, true);
     f.pageMeta[pageIndex] = meta;
     f.pages[pageIndex] = meta.text;
     f.fullText = f.pages.join("\n");
@@ -2069,8 +2090,8 @@ async function forceOcrPage(fileIndex, pageIndex) {
     saveSession();
     renderVerifier();
   } catch (e) {
-    console.error(e); alert("Falha ao forçar OCR: " + e.message);
-    if (fb) { fb.disabled = false; fb.textContent = "🔁 Forçar OCR nesta página"; }
+    console.error(e); alert("Falha ao reprocessar com OCR: " + e.message);
+    if (fb) { fb.disabled = false; fb.textContent = "🔁 Reprocessar em alta resolução"; }
   }
 }
 
