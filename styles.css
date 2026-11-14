@@ -329,3 +329,19 @@ input.flash, textarea.flash { animation: fieldflash 0.9s ease; }
   .review-right, .verifier { display: none !important; }
   .review-split { display: block; }
 }
+
+/* =========================================================================
+ * Relatórios segmentados + botão Forçar OCR
+ * ========================================================================= */
+.reports-summary:empty { display: none; }
+.reports-summary { margin: 0 0 14px; }
+.reports-summary h4 { margin: 0 0 8px; color: var(--blue); font-size: .95rem; }
+.rep-card { border: 1px solid var(--border); border-left: 4px solid var(--blue); border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; background: #fafbfc; font-size: .86rem; }
+.rep-card.amb { border-left-color: #e6a100; background: #fff8e8; }
+.rep-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rep-pages { color: var(--muted); font-size: .8rem; margin-top: 3px; }
+.rep-amb { color: #8a5a00; font-weight: 700; font-size: .78rem; background: #ffe9b0; border: 1px solid #e6c84a; border-radius: 10px; padding: 1px 8px; }
+
+.btn-sm { padding: 4px 10px; font-size: .8rem; }
+
+@media print { .reports-summary { display: none !important; } }
